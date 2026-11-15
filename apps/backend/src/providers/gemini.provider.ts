@@ -9,11 +9,11 @@ export class GeminiProvider implements AIProvider {
   private readonly logger = new Logger(GeminiProvider.name);
 
   private readonly availableModels = [
+    'gemini-flash-lite-latest',
     'gemini-3.1-flash-lite',
     'gemini-3.5-flash-lite',
     'gemini-2.5-flash',
-    'gemini-1.5-flash',
-    'gemini-1.5-pro',
+    'gemini-flash-latest',
   ];
 
   getAvailableModels(): string[] {
@@ -30,11 +30,11 @@ export class GeminiProvider implements AIProvider {
       return {
         success: false,
         message: 'No Gemini API key provided or found in configuration/environment.',
-        model: testConfig?.model || 'gemini-3.1-flash-lite',
+        model: testConfig?.model || 'gemini-flash-lite-latest',
       };
     }
 
-    const modelName = testConfig?.model || 'gemini-3.1-flash-lite';
+    const modelName = testConfig?.model || 'gemini-flash-lite-latest';
 
     try {
       const genAI = new GoogleGenerativeAI(apiKey);
