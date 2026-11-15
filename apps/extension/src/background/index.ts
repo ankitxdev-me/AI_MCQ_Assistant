@@ -1,5 +1,9 @@
+import { resolveMediaItems, cropScreenshot, MediaItem, CropRect, ImagePayload } from './media';
+
 const BACKEND_BASE_URL = 'http://127.0.0.1:3000';
 const DEFAULT_PAIRING_TOKEN = 'ai_mcq_assistant_secret_token_change_in_production';
+// Gemini with images can take a while; anything longer means the backend is stuck.
+const BACKEND_TIMEOUT_MS = 120000;
 
 // Ensure action icon click opens sidepanel directly in the browser window
 if (chrome.sidePanel && chrome.sidePanel.setPanelBehavior) {
@@ -21,6 +25,31 @@ if (chrome.action && chrome.action.onClicked) {
   });
 }
 
+/**
+ * Keeps the service worker alive while long work is in flight.
+ * Chrome stops an idle worker after ~30s, which killed slow Gemini requests mid-way and
+ * left the Auto-Loop with "message port closed". Any extension API call resets the idle timer.
+ */
+let keepAliveCount = 0;
+let keepAliveTimer: ReturnType<typeof setInterval> | null = null;
+async function withKeepAlive<T>(work: () => Promise<T>): Promise<T> {
+  keepAliveCount++;
+  if (!keepAliveTimer) {
+    keepAliveTimer = setInterval(() => {
+      chrome.runtime.getPlatformInfo().catch(() => {});
+    }, 20000);
+  }
+  try {
+    return await work();
+  } finally {
+    keepAliveCount--;
+    if (keepAliveCount === 0 && keepAliveTimer) {
+      clearInterval(keepAliveTimer);
+      keepAliveTimer = null;
+    }
+  }
+}
+
 // Retrieve pairing token from chrome.storage or use default
 async function getPairingToken(): Promise<string> {
   const result = await chrome.storage.local.get(['pairingToken']);
@@ -34,10 +63,17 @@ async function fetchBackend(endpoint: string, options: RequestInit = {}): Promis
   headers.set('Content-Type', 'application/json');
   headers.set('x-pairing-token', token);
 
-  const response = await fetch(`${BACKEND_BASE_URL}${endpoint}`, {
-    ...options,
-    headers,
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${BACKEND_BASE_URL}${endpoint}`, {
+      ...options,
+      headers,
+      signal: AbortSignal.timeout(BACKEND_TIMEOUT_MS),
+    });
+  } catch (err: any) {
+    if (err?.name === 'TimeoutError') throw new Error('Backend request timed out');
+    throw new Error(`Failed to fetch: backend not reachable at ${BACKEND_BASE_URL} (${err?.message || err})`);
+  }
 
   if (!response.ok) {
     const errorData = await response.json().catch(() => ({ message: response.statusText }));
@@ -47,14 +83,64 @@ async function fetchBackend(endpoint: string, options: RequestInit = {}): Promis
   return response.json();
 }
 
+// captureVisibleTab is limited to 2 calls per second; queue captures across tabs.
+let captureChain: Promise<unknown> = Promise.resolve();
+function captureTab(windowId: number): Promise<string> {
+  const run = captureChain.then(async () => {
+    const shot = await chrome.tabs.captureVisibleTab(windowId, { format: 'png' });
+    await new Promise((r) => setTimeout(r, 600));
+    return shot;
+  });
+  captureChain = run.catch(() => {});
+  return run;
+}
+
+async function resolveMedia(
+  payload: { items?: MediaItem[]; screenshotRect?: CropRect; tabId?: number },
+  senderTab?: chrome.tabs.Tab,
+): Promise<{ images: ImagePayload[]; failures: string[]; screenshotUsed: boolean }> {
+  const { images, failures } = await resolveMediaItems(payload.items || []);
+  let screenshotUsed = false;
+
+  if (payload.screenshotRect) {
+    try {
+      const tab = payload.tabId ? await chrome.tabs.get(payload.tabId) : senderTab;
+      if (!tab?.id || tab.windowId === undefined) throw new Error('Unknown tab');
+      // Chrome can only screenshot the tab that is currently shown in its window
+      if (!tab.active) throw new Error('Tab is not the visible tab in its window');
+      const shot = await captureTab(tab.windowId);
+      images.push(await cropScreenshot(shot, payload.screenshotRect));
+      screenshotUsed = true;
+    } catch (err: any) {
+      failures.push(`Screenshot: ${err?.message || err}`);
+    }
+  }
+
+  return { images, failures, screenshotUsed };
+}
+
 // Handle runtime messages
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'BACKEND_FETCH') {
     const { endpoint, options } = message.payload;
-    fetchBackend(endpoint, options)
+    withKeepAlive(() => fetchBackend(endpoint, options))
       .then((data) => sendResponse({ success: true, data }))
       .catch((err) => sendResponse({ success: false, error: err.message }));
     return true; // async reply
+  }
+
+  // Timer for content scripts in throttled background tabs (see content/timing.ts)
+  if (message.type === 'SLEEP') {
+    const ms = Math.min(Math.max(Number(message.payload?.ms) || 0, 0), 60000);
+    setTimeout(() => sendResponse({ success: true }), ms);
+    return true;
+  }
+
+  if (message.type === 'RESOLVE_MEDIA') {
+    withKeepAlive(() => resolveMedia(message.payload || {}, sender.tab))
+      .then((res) => sendResponse({ success: true, ...res }))
+      .catch((err) => sendResponse({ success: false, images: [], failures: [String(err?.message || err)] }));
+    return true;
   }
 
   if (message.type === 'CHECK_HEALTH') {
@@ -136,4 +222,3 @@ if (chrome.commands && chrome.commands.onCommand) {
     }
   });
 }
-

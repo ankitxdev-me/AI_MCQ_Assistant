@@ -16,6 +16,7 @@ import {
   CustomKnowledgeItem,
 } from '@ai-mcq/shared-types';
 import { v4 as uuidv4 } from 'uuid';
+import { createHash } from 'crypto';
 
 @Injectable()
 export class QuestionsService {
@@ -46,16 +47,25 @@ export class QuestionsService {
   }
 
   async solveQuestion(payload: SolveQuestionPayload): Promise<SolveQuestionResponse> {
-    const { sessionId, question, options, questionFingerprint, forceFresh } = payload;
+    const { question, options, questionFingerprint, forceFresh } = payload;
 
-    // Check if session exists and is active
-    let session: PracticeSession;
-    try {
-      session = this.sessionsService.getSession(sessionId);
-    } catch {
-      this.logger.log(`Session ${sessionId} not found. Auto-creating session.`);
-      session = this.sessionsService.createSession('http://127.0.0.1:3000', 'Auto Practice Session');
+    // Reuse the caller's session, or open one for this page when none was supplied
+    // (the per-tab Auto-Loop starts without a session).
+    let session: PracticeSession | null = null;
+    if (payload.sessionId) {
+      try {
+        session = this.sessionsService.getSession(payload.sessionId);
+      } catch {
+        this.logger.log(`Session ${payload.sessionId} not found. Auto-creating session.`);
+      }
     }
+    if (!session) {
+      session = this.sessionsService.createSession(
+        payload.pageUrl || 'http://127.0.0.1:3000',
+        payload.pageTitle || 'Auto Practice Session',
+      );
+    }
+    const sessionId = session.id;
 
     if (session.status === 'PAUSED') {
       throw new BadRequestException('Session is paused. Resume the session to continue solving.');
@@ -64,20 +74,42 @@ export class QuestionsService {
       throw new BadRequestException('Session is stopped.');
     }
 
+    // Make sure the question is on the session record so results and metrics include it
+    if (!session.questions.some((q) => q.fingerprint === questionFingerprint)) {
+      session = this.sessionsService.recordExtractedQuestions(sessionId, [
+        {
+          fingerprint: questionFingerprint,
+          questionNumber: payload.questionNumber,
+          questionText: question,
+          options,
+          extractionStrategy: 'fallback',
+          extractionConfidence: 1,
+          status: 'READY_FOR_AI',
+        },
+      ]);
+    }
+
+    // Custom-knowledge notes change answers. An answer made with different notes is stale.
+    const knowledgeKey = this.currentKnowledgeKey();
+
     // 1. Duplicate & Cache Check
     if (!forceFresh) {
       const existingInSession = session.questions.find(
         (q) => q.fingerprint === questionFingerprint && q.aiAnswer,
       );
-      if (existingInSession && existingInSession.aiAnswer) {
-        this.logger.log(`Serving cached answer for fingerprint ${questionFingerprint} from session`);
-        return {
-          success: true,
-          questionId: existingInSession.id || uuidv4(),
-          answer: existingInSession.aiAnswer,
-          cached: true,
-          timestamp: new Date().toISOString(),
-        };
+      if (existingInSession?.aiAnswer && this.isCacheUsable(existingInSession.aiAnswer, knowledgeKey)) {
+        const remapped = this.remapAnswer(existingInSession.aiAnswer, existingInSession.options, options);
+        if (remapped) {
+          this.logger.log(`Serving cached answer for fingerprint ${questionFingerprint} from session`);
+          return {
+            success: true,
+            sessionId,
+            questionId: existingInSession.id || uuidv4(),
+            answer: remapped,
+            cached: true,
+            timestamp: new Date().toISOString(),
+          };
+        }
       }
 
       // Check global cache table
@@ -87,16 +119,22 @@ export class QuestionsService {
       );
       if (cachedRow?.response_json) {
         try {
-          const cachedAnswer: AIAnswerResult = JSON.parse(cachedRow.response_json);
-          this.logger.log(`Serving answer for fingerprint ${questionFingerprint} from cache table`);
-          this.sessionsService.updateQuestionAnswer(sessionId, questionFingerprint, cachedAnswer);
-          return {
-            success: true,
-            questionId: uuidv4(),
-            answer: cachedAnswer,
-            cached: true,
-            timestamp: new Date().toISOString(),
-          };
+          const { answer: cachedAnswer, options: snapshot } = this.readCacheEntry(cachedRow.response_json);
+          const remapped = this.isCacheUsable(cachedAnswer, knowledgeKey)
+            ? this.remapAnswer(cachedAnswer, snapshot, options)
+            : null;
+          if (remapped) {
+            this.logger.log(`Serving answer for fingerprint ${questionFingerprint} from cache table`);
+            this.sessionsService.updateQuestionAnswer(sessionId, questionFingerprint, remapped);
+            return {
+              success: true,
+              sessionId,
+              questionId: uuidv4(),
+              answer: remapped,
+              cached: true,
+              timestamp: new Date().toISOString(),
+            };
+          }
         } catch (e) {
           // ignore corrupted cache
         }
@@ -109,36 +147,30 @@ export class QuestionsService {
         [cleanQ, questionFingerprint],
       );
 
-      if (verifiedRow?.correct_option_text) {
-        const normTarget = verifiedRow.correct_option_text.trim().toLowerCase();
-        const matchedOpt = options.find((o) => {
-          const norm = o.text.trim().toLowerCase();
-          return (
-            norm === normTarget ||
-            (normTarget.length > 2 && (norm.includes(normTarget) || normTarget.includes(norm)))
-          );
-        });
-
-        if (matchedOpt) {
-          const verifiedAnswer: AIAnswerResult = {
-            selected_option_id: matchedOpt.id,
-            answer_text: matchedOpt.text,
-            explanation: `Verified correct ground truth from previously recorded portal assessment.`,
-            confidence: 1.0,
-            needs_review: false,
-          };
-          this.logger.log(
-            `Serving verified ground truth for question: "${cleanQ.slice(0, 50)}..." -> Option ${matchedOpt.id} (${matchedOpt.text})`,
-          );
-          this.sessionsService.updateQuestionAnswer(session.id, questionFingerprint, verifiedAnswer);
-          return {
-            success: true,
-            questionId: uuidv4(),
-            answer: verifiedAnswer,
-            cached: true,
-            timestamp: new Date().toISOString(),
-          };
-        }
+      const matchedOpt = verifiedRow?.correct_option_text
+        ? this.findOptionByText(verifiedRow.correct_option_text, options)
+        : null;
+      if (matchedOpt) {
+        const verifiedAnswer: AIAnswerResult = {
+          selected_option_id: matchedOpt.id,
+          answer_text: matchedOpt.text,
+          explanation: `Verified correct ground truth from previously recorded portal assessment.`,
+          confidence: 1.0,
+          needs_review: false,
+          verified: true,
+        };
+        this.logger.log(
+          `Serving verified ground truth for question: "${cleanQ.slice(0, 50)}..." -> Option ${matchedOpt.id} (${matchedOpt.text})`,
+        );
+        this.sessionsService.updateQuestionAnswer(session.id, questionFingerprint, verifiedAnswer);
+        return {
+          success: true,
+          sessionId,
+          questionId: uuidv4(),
+          answer: verifiedAnswer,
+          cached: true,
+          timestamp: new Date().toISOString(),
+        };
       }
     }
 
@@ -167,7 +199,7 @@ export class QuestionsService {
 
     // Retrieve Web / Browser Search Evidence only if explicitly enabled (disabled by default for instant speed)
     let webSearchEvidence = payload.webSearchEvidence || [];
-    if ((payload as any).enableWebSearch && webSearchEvidence.length === 0) {
+    if (payload.enableWebSearch && webSearchEvidence.length === 0) {
       try {
         webSearchEvidence = await this.webSearchService.search(question, options);
       } catch (err: any) {
@@ -184,7 +216,7 @@ export class QuestionsService {
 
     try {
       this.logger.log(
-        `Sending question (fingerprint: ${questionFingerprint}) to Gemini model: ${model} [Topic: ${topic}] [WebEvidence: ${webSearchEvidence?.length || 0} snippets]`,
+        `Sending question (fingerprint: ${questionFingerprint}) to Gemini model: ${model} [Topic: ${topic}] [WebEvidence: ${webSearchEvidence?.length || 0} snippets] [Images: ${payload.images?.length || 0}] [Queue: ${this.geminiProvider.queueLength}]`,
       );
 
       const aiAnswer = await this.geminiProvider.generateAnswer(
@@ -200,12 +232,14 @@ export class QuestionsService {
         topicKnowledge,
         customKnowledgeText,
         webSearchEvidence,
+        payload.images,
       );
+      aiAnswer.knowledgeKey = knowledgeKey;
 
-      // Save to cache table
+      // Save to cache table (with the option texts, so a reshuffled question maps correctly)
       this.db.run(
         `INSERT OR REPLACE INTO cache (fingerprint, response_json, created_at) VALUES (?, ?, ?)`,
-        [questionFingerprint, JSON.stringify(aiAnswer), new Date().toISOString()],
+        [questionFingerprint, this.writeCacheEntry(aiAnswer, options), new Date().toISOString()],
       );
 
       // Update question and session metrics
@@ -228,6 +262,7 @@ export class QuestionsService {
 
       return {
         success: true,
+        sessionId,
         questionId,
         answer: aiAnswer,
         cached: false,
@@ -241,6 +276,100 @@ export class QuestionsService {
       );
       throw new BadRequestException(`AI Processing error: ${err.message}`);
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Cache helpers
+  // ---------------------------------------------------------------------------
+
+  /** Hash of the active custom-knowledge notes ('' when there are none). */
+  currentKnowledgeKey(): string {
+    const notes = this.getCustomKnowledge();
+    if (notes.length === 0) return '';
+    const raw = notes
+      .map((n) => `${n.id}:${n.content}`)
+      .sort()
+      .join('\n');
+    return createHash('sha1').update(raw).digest('hex').slice(0, 16);
+  }
+
+  /** Verified answers are always reusable; AI answers only if made with the same notes. */
+  private isCacheUsable(answer: AIAnswerResult, knowledgeKey: string): boolean {
+    if (answer.verified) return true;
+    return (answer.knowledgeKey || '') === knowledgeKey;
+  }
+
+  private writeCacheEntry(answer: AIAnswerResult, options: { id: string; text: string }[]): string {
+    return JSON.stringify({ answer, options: options.map((o) => ({ id: o.id, text: o.text })) });
+  }
+
+  private readCacheEntry(json: string): { answer: AIAnswerResult; options?: { id: string; text: string }[] } {
+    const parsed = JSON.parse(json);
+    if (parsed && parsed.answer && Array.isArray(parsed.options)) return parsed;
+    return { answer: parsed }; // older entries stored the bare answer
+  }
+
+  private static normText(t: string): string {
+    return (t || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  }
+
+  /**
+   * Re-points a cached answer at the current option IDs using option text.
+   * Portals often shuffle options on a revisit; the fingerprint ignores order, so without this
+   * the cached letter "B" would now point at a different answer. Returns null if it cannot map.
+   */
+  remapAnswer(
+    answer: AIAnswerResult,
+    snapshot: { id: string; text: string }[] | undefined,
+    current: { id: string; text: string }[],
+  ): AIAnswerResult | null {
+    if (!snapshot || snapshot.length === 0) return answer;
+    const textById = new Map(snapshot.map((o) => [o.id, QuestionsService.normText(o.text)]));
+    const idByText = new Map(current.map((o) => [QuestionsService.normText(o.text), o.id]));
+    const mapId = (id: string): string | null => {
+      const t = textById.get(id.trim());
+      return t === undefined ? null : idByText.get(t) ?? null;
+    };
+    const mapList = (ids: string[]): string[] | null => {
+      const out = ids.map(mapId);
+      return out.every((x) => x !== null) ? (out as string[]) : null;
+    };
+
+    const result: AIAnswerResult = { ...answer };
+    if (answer.ordered_sequence?.length) {
+      const seq = mapList(answer.ordered_sequence);
+      if (!seq) return null;
+      result.ordered_sequence = seq;
+      result.selected_option_id = seq.join(', ');
+      return result;
+    }
+    if (answer.selected_option_ids?.length) {
+      const ids = mapList(answer.selected_option_ids);
+      if (!ids) return null;
+      result.selected_option_ids = ids;
+      result.selected_option_id = ids.join(', ');
+      return result;
+    }
+    const parts = String(answer.selected_option_id).split(/[,;]\s*/).filter(Boolean);
+    const ids = mapList(parts);
+    if (!ids) return null;
+    result.selected_option_id = ids.join(', ');
+    return result;
+  }
+
+  /** Exact option text first; partial only for longer text with a single candidate ("30" never matches "3000"). */
+  private findOptionByText(target: string, options: { id: string; text: string }[]) {
+    const strip = (t: string) => QuestionsService.normText(t).replace(/^\(?[a-h1-8][\)\.:]\s+/, '');
+    const want = strip(target);
+    if (!want) return null;
+    const exact = options.find((o) => strip(o.text) === want);
+    if (exact) return exact;
+    if (want.length < 8) return null;
+    const partial = options.filter((o) => {
+      const t = strip(o.text);
+      return t.length > 0 && (t.includes(want) || want.includes(t));
+    });
+    return partial.length === 1 ? partial[0] : null;
   }
 
   getQuestionById(id: string) {
@@ -322,6 +451,7 @@ export class QuestionsService {
           : `Verified portal answer (previously selected: ${selectedOptionText || 'N/A'}).`,
         confidence: 1.0,
         needs_review: false,
+        verified: true,
       };
 
       this.db.run(

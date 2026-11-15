@@ -286,16 +286,7 @@ export function matchAIMultipleAnswersToOptions(
         isMatched: true,
       };
     }
-    // Safety fallback: select the first option so automation loop NEVER halts
-    if (options.length > 0) {
-      return {
-        matchedOptions: [options[0]],
-        matchedIds: [options[0].id],
-        matchedTexts: [options[0].text],
-        confidence: 0.5,
-        isMatched: true,
-      };
-    }
+    // No match: report it. Guessing the first option silently submitted wrong answers.
     return {
       matchedOptions: [],
       matchedIds: [],

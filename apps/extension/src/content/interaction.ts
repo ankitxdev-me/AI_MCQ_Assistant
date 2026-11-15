@@ -1,4 +1,6 @@
 import { OptionItem } from '@ai-mcq/shared-types';
+import { isOptionRendered, isRendered } from './visibility';
+import { sleep } from './timing';
 
 export class DOMInteractionManager {
   /**
@@ -21,86 +23,24 @@ export class DOMInteractionManager {
 
     let targetElement: HTMLElement | null = null;
 
-    // 1. Target by Option Text Matching (Most reliable on dynamic portals)
-    if (optionText && optionText.trim()) {
-      const normTarget = optionText.trim().toLowerCase();
+    // 0. The selector captured at extraction time points at the exact control of THIS question.
+    //    Trust it when it is unique, still on screen, and its label still reads like the option.
+    //    This stops a same-worded option in another question on the page from being clicked.
+    targetElement = this.resolveExtractedOption(elementSelector, optionText);
 
-      // Check all inputs (radios & checkboxes) with their specific labels only
-      const allInputs = Array.from(
-        document.querySelectorAll<HTMLInputElement>('input[type="radio"], input[type="checkbox"]'),
-      );
-      for (const input of allInputs) {
-        let labelText = '';
-
-        // Check HTML5 label association
-        if (input.labels && input.labels.length > 0) {
-          labelText = (input.labels[0].textContent || '').trim().toLowerCase();
-        } else if (input.id) {
-          const lbl = document.querySelector(`label[for="${input.id}"]`);
-          if (lbl) labelText = (lbl.textContent || '').trim().toLowerCase();
-        }
-
-        // Check closest label tag
-        if (!labelText) {
-          const parentLabel = input.closest('label');
-          if (parentLabel && parentLabel.querySelectorAll('input').length === 1) {
-            labelText = (parentLabel.textContent || '').trim().toLowerCase();
-          }
-        }
-
-        // Check immediate parent or sibling only if isolated to this input
-        if (!labelText && input.parentElement) {
-          const parent = input.parentElement;
-          if (parent.querySelectorAll('input').length === 1) {
-            labelText = (parent.textContent || '').trim().toLowerCase();
-          }
-        }
-
-        if (labelText && (labelText.includes(normTarget) || normTarget.includes(labelText))) {
-          targetElement = input;
-          break;
-        }
-      }
-
-      // Check all isolated option containers / labels
-      if (!targetElement) {
-        const allLabels = Array.from(
-          document.querySelectorAll<HTMLElement>(
-            'label, [role="radio"], [role="checkbox"], .radio, .checkbox, .option, li',
-          ),
-        );
-        for (const lbl of allLabels) {
-          if (lbl.querySelectorAll('input').length > 1) continue;
-
-          const text = lbl.textContent?.trim().toLowerCase() || '';
-          if (text && (text.includes(normTarget) || normTarget.includes(text))) {
-            const innerInput = lbl.querySelector<HTMLInputElement>(
-              'input[type="radio"], input[type="checkbox"]',
-            );
-            targetElement = innerInput || lbl;
-            break;
-          }
-        }
-      }
+    // 1. Target by option text (fallback for portals that re-render and break selectors).
+    //    Exact label match wins. Partial match is only trusted for longer texts and only when
+    //    a single option matches, so "30" can never click "3000".
+    if (!targetElement && optionText && optionText.trim()) {
+      targetElement = this.findOptionByText(optionText);
     }
 
-    // 2. Target by Positional Index (Option A -> index 0, Option B -> index 1, Option C -> index 2, Option D -> index 3)
+    // 2. Target by position (A -> 1st, B -> 2nd). Only safe when the page shows one question.
     if (!targetElement) {
       const optionIndex = this.getOptionIndex(optionId);
-      if (optionIndex >= 0) {
-        const allInputs = Array.from(
-          document.querySelectorAll<HTMLInputElement>('input[type="radio"], input[type="checkbox"]'),
-        );
-        if (allInputs.length > optionIndex) {
-          targetElement = allInputs[optionIndex];
-        } else {
-          const ariaInputs = Array.from(
-            document.querySelectorAll<HTMLElement>('[role="radio"], [role="checkbox"]'),
-          );
-          if (ariaInputs.length > optionIndex) {
-            targetElement = ariaInputs[optionIndex];
-          }
-        }
+      const controls = this.renderedOptionControls();
+      if (optionIndex >= 0 && controls.length > optionIndex && this.looksLikeSingleQuestion(controls)) {
+        targetElement = controls[optionIndex];
       }
     }
 
@@ -125,73 +65,125 @@ export class DOMInteractionManager {
       };
     }
 
-    // Scroll into view gently
     if (typeof targetElement.scrollIntoView === 'function') {
       targetElement.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     }
-
-    // Focus
     targetElement.focus?.();
 
-    if (targetElement instanceof HTMLInputElement) {
-      if (targetElement.type === 'checkbox') {
-        if (!targetElement.checked) {
-          targetElement.click();
-        }
-      } else {
-        targetElement.checked = true;
-        targetElement.dispatchEvent(new Event('input', { bubbles: true }));
-        targetElement.dispatchEvent(new Event('change', { bubbles: true }));
-        targetElement.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
-        targetElement.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
-        targetElement.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-      }
+    const input =
+      targetElement instanceof HTMLInputElement
+        ? targetElement
+        : targetElement.querySelector<HTMLInputElement>('input[type="radio"], input[type="checkbox"]');
 
-      // Also dispatch click on enclosing label/div for React/Angular component frameworks
-      const parentWrapper = targetElement.closest('label, [class*="radio" i], [class*="checkbox" i], [class*="option" i], li, div');
-      if (parentWrapper && parentWrapper !== targetElement && parentWrapper !== document.body) {
-        parentWrapper.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
-        parentWrapper.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
-        parentWrapper.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-      }
-
-      const isVerified = targetElement.checked;
+    if (input && (input.type === 'radio' || input.type === 'checkbox')) {
+      const ok = this.setInputChecked(input, true);
       return {
-        success: isVerified,
-        message: isVerified
+        success: ok,
+        message: ok
           ? `Successfully selected option ${optionId}`
           : `Attempted selection on option ${optionId}, but element did not confirm checked state.`,
       };
-    } else {
-      // Click container, label or custom ARIA radio/checkbox
-      const innerInput = targetElement.querySelector<HTMLInputElement>(
-        'input[type="radio"], input[type="checkbox"]',
-      );
-      if (innerInput) {
-        if (innerInput.type === 'checkbox') {
-          if (!innerInput.checked) {
-            innerInput.click();
-          }
-        } else {
-          innerInput.checked = true;
-          innerInput.dispatchEvent(new Event('input', { bubbles: true }));
-          innerInput.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-      }
-
-      targetElement.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
-      targetElement.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
-      targetElement.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-
-      if (targetElement.getAttribute('role') === 'radio' || targetElement.getAttribute('role') === 'checkbox') {
-        targetElement.setAttribute('aria-checked', 'true');
-      }
-
-      return {
-        success: true,
-        message: `Triggered selection click for option ${optionId}`,
-      };
     }
+
+    // Custom ARIA radio/checkbox or a clickable container
+    if (targetElement.getAttribute('aria-checked') !== 'true') {
+      this.dispatchClick(targetElement);
+    }
+    const role = targetElement.getAttribute('role');
+    const verified = role === 'radio' || role === 'checkbox' ? targetElement.getAttribute('aria-checked') === 'true' : true;
+    return {
+      success: verified,
+      message: verified
+        ? `Triggered selection click for option ${optionId}`
+        : `Clicked option ${optionId}, but the page did not mark it as selected.`,
+    };
+  }
+
+  /** Full pointer + click sequence for custom (non-input) controls. */
+  private dispatchClick(el: HTMLElement): void {
+    const opts = { bubbles: true, cancelable: true, view: window };
+    el.dispatchEvent(new PointerEvent('pointerdown', opts));
+    el.dispatchEvent(new MouseEvent('mousedown', opts));
+    el.dispatchEvent(new PointerEvent('pointerup', opts));
+    el.dispatchEvent(new MouseEvent('mouseup', opts));
+    el.click();
+  }
+
+  /**
+   * Sets a radio/checkbox the way a real user would, so React/Vue/Angular state updates.
+   *
+   * The old code set `.checked = true` and then dispatched synthetic events. React tracks the
+   * checked value through that same setter, so it saw "no change" and never fired onChange:
+   * the circle looked filled but the portal's Submit had nothing selected. It also clicked the
+   * wrapping <label> afterwards, which toggled checkboxes straight back off.
+   */
+  private setInputChecked(input: HTMLInputElement, checked: boolean): boolean {
+    if (input.checked === checked) return true;
+
+    // 1. Native click: toggles state and fires click/input/change exactly like a user click
+    input.click();
+    if (input.checked === checked) return true;
+
+    // 2. Some components ignore the input and listen on their wrapper
+    const wrapper =
+      (input.labels && input.labels[0]) ||
+      input.closest<HTMLElement>('label, [class*="radio" i], [class*="checkbox" i], [class*="option" i]');
+    if (wrapper && wrapper !== input) {
+      this.dispatchClick(wrapper as HTMLElement);
+      if (input.checked === checked) return true;
+    }
+
+    // 3. Last resort: use the prototype setter (bypasses React's value tracker) and notify
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked')?.set;
+    setter?.call(input, checked);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    return input.checked === checked;
+  }
+
+  private renderedOptionControls(): HTMLElement[] {
+    return Array.from(
+      document.querySelectorAll<HTMLElement>('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]'),
+    ).filter((el) => !el.closest('#ai-mcq-assistant-root') && isOptionRendered(el));
+  }
+
+  /** One visible option group: every visible radio shares a name, or there are only a handful. */
+  private looksLikeSingleQuestion(controls: HTMLElement[]): boolean {
+    const names = new Set(
+      controls.filter((c): c is HTMLInputElement => c instanceof HTMLInputElement).map((c) => c.name).filter(Boolean),
+    );
+    return names.size <= 1 && controls.length <= 8;
+  }
+
+  private labelTextOf(el: HTMLElement): string {
+    const norm = (t: string | null | undefined) => (t || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    if (el instanceof HTMLInputElement) {
+      if (el.labels && el.labels.length > 0) return norm(el.labels[0].textContent);
+      const parentLabel = el.closest('label');
+      if (parentLabel && parentLabel.querySelectorAll('input').length === 1) return norm(parentLabel.textContent);
+      if (el.parentElement && el.parentElement.querySelectorAll('input').length === 1) return norm(el.parentElement.textContent);
+      return '';
+    }
+    return norm(el.getAttribute('aria-label')) || norm(el.textContent);
+  }
+
+  /** Finds a visible option control by its label text without partial-match accidents. */
+  private findOptionByText(optionText: string): HTMLElement | null {
+    const target = optionText.replace(/\s+/g, ' ').trim().toLowerCase();
+    const stripPrefix = (t: string) => t.replace(/^\(?[a-h1-8][\)\.:]\s+/i, '').trim();
+    const targetCore = stripPrefix(target);
+
+    const controls = this.renderedOptionControls();
+    const labelled = controls.map((el) => ({ el, text: this.labelTextOf(el) })).filter((c) => c.text);
+
+    const exact = labelled.find((c) => c.text === target || stripPrefix(c.text) === targetCore);
+    if (exact) return exact.el;
+
+    if (targetCore.length >= 6) {
+      const partial = labelled.filter((c) => c.text.includes(targetCore) || targetCore.includes(stripPrefix(c.text)));
+      if (partial.length === 1) return partial[0].el;
+    }
+    return null;
   }
 
   /**
@@ -221,65 +213,21 @@ export class DOMInteractionManager {
 
     // Helper: Finds the best DOM target element for an option
     const findOptionElement = (opt: OptionItem): HTMLElement | null => {
-      // 1. Target by Option Text Matching (most reliable on dynamic React portals)
-      if (opt.text && opt.text.trim().length > 3) {
-        const normTarget = opt.text.trim().toLowerCase();
+      // 1. The exact control captured at extraction time
+      const extracted = this.resolveExtractedOption(opt.elementSelector, opt.text);
+      if (extracted) return extracted;
 
-        // Check all checkbox inputs
-        const allInputs = Array.from(
-          document.querySelectorAll<HTMLInputElement>('input[type="checkbox"], input[type="radio"]'),
-        );
-        for (const input of allInputs) {
-          let labelText = '';
-          if (input.labels && input.labels.length > 0) {
-            labelText = (input.labels[0].textContent || '').trim().toLowerCase();
-          } else if (input.id) {
-            const lbl = document.querySelector(`label[for="${input.id}"]`);
-            if (lbl) labelText = (lbl.textContent || '').trim().toLowerCase();
-          }
-          if (!labelText && input.closest('label')) {
-            labelText = (input.closest('label')?.textContent || '').trim().toLowerCase();
-          }
-          if (labelText && (labelText.includes(normTarget) || normTarget.includes(labelText))) {
-            return input;
-          }
-        }
-
-        // Check custom checkbox/radio containers
-        const allLabels = Array.from(
-          document.querySelectorAll<HTMLElement>(
-            'label, [role="checkbox"], [role="radio"], [class*="checkbox" i], [class*="option" i], li',
-          ),
-        );
-        for (const lbl of allLabels) {
-          if (lbl.querySelectorAll('input').length > 1) continue;
-          const text = (lbl.textContent || '').trim().toLowerCase();
-          if (text && (text.includes(normTarget) || normTarget.includes(text))) {
-            const innerInput = lbl.querySelector<HTMLInputElement>('input[type="checkbox"], input[type="radio"]');
-            return innerInput || lbl;
-          }
-        }
+      // 2. Label text, exact match first (never lets "30" pick "3000")
+      if (opt.text && opt.text.trim()) {
+        const byText = this.findOptionByText(opt.text);
+        if (byText) return byText;
       }
 
-      // 2. Target by elementSelector
-      if (opt.elementSelector) {
-        try {
-          const el = document.querySelector<HTMLElement>(opt.elementSelector);
-          if (el) return el;
-        } catch (e) {}
-      }
-
-      // 3. Target by Positional Index
+      // 3. Position, only when the page shows a single question
       const idx = this.getOptionIndex(opt.id);
-      if (idx >= 0) {
-        const allInputs = Array.from(
-          document.querySelectorAll<HTMLElement>(
-            'input[type="checkbox"], [role="checkbox"], [class*="checkbox" i], input[type="radio"]',
-          ),
-        );
-        if (idx < allInputs.length) {
-          return allInputs[idx];
-        }
+      const controls = this.renderedOptionControls();
+      if (idx >= 0 && idx < controls.length && this.looksLikeSingleQuestion(controls)) {
+        return controls[idx];
       }
 
       return this.findOptionFallback(opt.id);
@@ -311,20 +259,13 @@ export class DOMInteractionManager {
           : el.querySelector<HTMLInputElement>('input[type="checkbox"], input[type="radio"]');
 
       if (innerInput && (innerInput.type === 'checkbox' || innerInput.type === 'radio')) {
-        if (innerInput.checked !== select) {
-          innerInput.click();
-          if (innerInput.checked !== select) {
-            innerInput.checked = select;
-            innerInput.dispatchEvent(new Event('input', { bubbles: true }));
-            innerInput.dispatchEvent(new Event('change', { bubbles: true }));
-          }
-        }
+        this.setInputChecked(innerInput, select);
         return;
       }
 
       const currentlyChecked = isElementChecked(el);
       if (currentlyChecked !== select) {
-        el.click();
+        this.dispatchClick(el);
         if (el.getAttribute('role') === 'checkbox' || el.getAttribute('role') === 'radio') {
           el.setAttribute('aria-checked', select ? 'true' : 'false');
         }
@@ -332,29 +273,28 @@ export class DOMInteractionManager {
     };
 
     if (options.length > 0) {
+      let wanted = 0;
       for (const opt of options) {
         const optId = opt.id.replace(/^option\s*/i, '').trim().toUpperCase();
         const altId = letterToNum[optId] || numToLetter[optId];
         const shouldBeSelected = normTargets.has(optId) || (altId ? normTargets.has(altId) : false);
+        if (shouldBeSelected) wanted++;
 
         const el = findOptionElement(opt);
         if (el) {
-          const checked = isElementChecked(el);
-
-          if (shouldBeSelected && !checked) {
-            toggleOption(el, true);
-            selectedCount++;
-          } else if (!shouldBeSelected && checked) {
-            toggleOption(el, false);
-          } else if (shouldBeSelected && checked) {
-            selectedCount++;
+          if (isElementChecked(el) !== shouldBeSelected) {
+            toggleOption(el, shouldBeSelected);
           }
+          if (shouldBeSelected && isElementChecked(el)) selectedCount++;
         }
       }
 
+      const success = wanted > 0 && selectedCount === wanted;
       return {
-        success: true,
-        message: `Selected ${selectedCount} option(s): [${Array.from(normTargets).join(', ')}]`,
+        success,
+        message: success
+          ? `Selected ${selectedCount} option(s): [${Array.from(normTargets).join(', ')}]`
+          : `Only ${selectedCount} of ${wanted} option(s) ended up selected on the page.`,
         selectedCount,
       };
     }
@@ -364,6 +304,87 @@ export class DOMInteractionManager {
       message: 'No options provided to selectMultipleOptions',
       selectedCount: 0,
     };
+  }
+
+  /**
+   * Types an answer into the question's text box so the page's framework sees it.
+   * Setting `.value` directly is invisible to React (same value-tracker issue as radios),
+   * so the prototype setter is used and input/change events are fired like real typing.
+   */
+  public fillTextAnswer(inputSelector: string | undefined, answer: string): { success: boolean; message: string } {
+    let box: HTMLInputElement | HTMLTextAreaElement | null = null;
+    if (inputSelector) {
+      try {
+        box = document.querySelector<HTMLInputElement | HTMLTextAreaElement>(inputSelector);
+      } catch {
+        box = null;
+      }
+    }
+    if (!box || !isRendered(box)) {
+      box = document.querySelector<HTMLTextAreaElement>('textarea:not([readonly]):not([disabled])');
+    }
+    if (!box) return { success: false, message: 'Could not find the answer box on the page.' };
+
+    box.scrollIntoView?.({ block: 'center' });
+    box.focus();
+    const proto = box instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+    if (setter) setter.call(box, answer);
+    else box.value = answer;
+    box.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: answer }));
+    box.dispatchEvent(new Event('change', { bubbles: true }));
+    box.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: answer.slice(-1) || 'a' }));
+    box.blur();
+
+    const ok = box.value === answer;
+    return {
+      success: ok,
+      message: ok
+        ? `Typed answer: "${answer.slice(0, 60)}"`
+        : box instanceof HTMLInputElement && box.type === 'number'
+          ? `The box only accepts numbers; the answer "${answer.slice(0, 40)}" was rejected.`
+          : 'The page did not accept the typed answer.',
+    };
+  }
+
+  /**
+   * Resolves the selector saved during extraction, only if it is unambiguous,
+   * rendered, and (when option text is known) still labelled with that text.
+   */
+  private resolveExtractedOption(elementSelector?: string, optionText?: string): HTMLElement | null {
+    if (!elementSelector) return null;
+
+    let matches: HTMLElement[] = [];
+    try {
+      matches = Array.from(document.querySelectorAll<HTMLElement>(elementSelector));
+    } catch (e) {
+      return null;
+    }
+    if (matches.length !== 1) return null;
+
+    const el = matches[0];
+    if (!isOptionRendered(el)) return null;
+
+    const norm = (optionText || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    if (!norm) return el;
+
+    const texts: string[] = [];
+    if (el instanceof HTMLInputElement) {
+      if (el.labels) Array.from(el.labels).forEach((l) => texts.push(l.textContent || ''));
+      texts.push(el.closest('label')?.textContent || '');
+      if (el.parentElement && el.parentElement.querySelectorAll('input').length === 1) {
+        texts.push(el.parentElement.textContent || '');
+      }
+    } else {
+      texts.push(el.getAttribute('aria-label') || '', el.textContent || '');
+    }
+
+    const labelMatches = texts
+      .map((t) => t.replace(/\s+/g, ' ').trim().toLowerCase())
+      .filter(Boolean)
+      .some((t) => t === norm || t.includes(norm) || norm.includes(t));
+
+    return labelMatches ? el : null;
   }
 
   private getOptionIndex(optionId: string): number {
@@ -378,661 +399,311 @@ export class DOMInteractionManager {
   }
 
   /**
-   * Executes drag and drop reordering directly in the page's main context (MAIN WORLD).
-   * Ensures React Beautiful DnD window listeners receive real events.
-   */
-  private async executePageContextReorder(
-    targetSequence: string[],
-    options: OptionItem[] = [],
-  ): Promise<boolean> {
-    try {
-      const channel = 'dnd_reorder_' + Math.random().toString(36).substring(2, 9);
-      const script = document.createElement('script');
-      script.textContent = `
-        (async function() {
-          try {
-            const targets = ${JSON.stringify(targetSequence)};
-            const options = ${JSON.stringify(options)};
-            const droppable = document.querySelector('[data-rbd-droppable-id], [data-rfd-droppable-id]');
-            
-            const getItems = () => {
-              if (droppable && droppable.children.length >= 2) {
-                return Array.from(droppable.children);
-              }
-              const found = Array.from(document.querySelectorAll('[data-rbd-draggable-id], [data-rfd-draggable-id], [draggable="true"], [class*="dnd-item"], [class*="draggable"]'));
-              return found.filter(el => {
-                const t = (el.textContent || '').trim().toLowerCase();
-                return !t.startsWith('submit') && !t.startsWith('show') && !t.startsWith('skip') && el.clientHeight > 15;
-              });
-            };
-
-            const findHandle = (el) => {
-              return el.querySelector('[data-rbd-drag-handle-draggable-id], [data-rfd-drag-handle-draggable-id], [class*="handle"], [class*="grip"], span') || el;
-            };
-
-            for (let i = 0; i < targets.length; i++) {
-              const desiredId = targets[i];
-              const items = getItems();
-              let currentIdx = -1;
-
-              for (let j = 0; j < items.length; j++) {
-                const text = (items[j].textContent || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-                const opt = options.find(o => o.id === desiredId);
-                const optText = opt ? opt.text.toLowerCase().replace(/[^a-z0-9]/g, '') : '';
-                if (j === parseInt(desiredId, 10) - 1 || (optText && text.includes(optText))) {
-                  currentIdx = j;
-                  break;
-                }
-              }
-
-              if (currentIdx >= 0 && currentIdx !== i && i < items.length) {
-                const src = items[currentIdx];
-                const handle = findHandle(src);
-                handle.focus();
-                
-                handle.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space', keyCode: 32, which: 32, bubbles: true, cancelable: true }));
-                await new Promise(r => setTimeout(r, 60));
-
-                const isDown = i > currentIdx;
-                const steps = Math.abs(i - currentIdx);
-                const arrowKey = isDown ? 'ArrowDown' : 'ArrowUp';
-                const arrowCode = isDown ? 40 : 38;
-
-                for (let s = 0; s < steps; s++) {
-                  handle.dispatchEvent(new KeyboardEvent('keydown', { key: arrowKey, code: arrowKey, keyCode: arrowCode, which: arrowCode, bubbles: true, cancelable: true }));
-                  await new Promise(r => setTimeout(r, 50));
-                }
-
-                handle.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space', keyCode: 32, which: 32, bubbles: true, cancelable: true }));
-                await new Promise(r => setTimeout(r, 100));
-              }
-            }
-
-            if (droppable && targets.length > 0) {
-              const currentItems = Array.from(droppable.children);
-              const targetItems = [];
-              targets.forEach(tId => {
-                const opt = options.find(o => o.id === tId);
-                const optText = opt ? opt.text.toLowerCase().replace(/[^a-z0-9]/g, '') : '';
-                const match = currentItems.find(it => {
-                  const itText = (it.textContent || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-                  return optText && itText.includes(optText);
-                });
-                if (match) targetItems.push(match);
-              });
-
-              if (targetItems.length === currentItems.length) {
-                targetItems.forEach(node => droppable.appendChild(node));
-              }
-            }
-
-            window.postMessage({ channel: '${channel}', success: true }, '*');
-          } catch (e) {
-            window.postMessage({ channel: '${channel}', success: false, error: e.message }, '*');
-          }
-        })();
-      `;
-
-      return new Promise<boolean>((resolve) => {
-        const timeout = setTimeout(() => {
-          window.removeEventListener('message', onMsg);
-          resolve(false);
-        }, 3000);
-
-        const onMsg = (evt: MessageEvent) => {
-          if (evt.data && evt.data.channel === channel) {
-            clearTimeout(timeout);
-            window.removeEventListener('message', onMsg);
-            resolve(!!evt.data.success);
-          }
-        };
-
-        window.addEventListener('message', onMsg);
-        (document.head || document.documentElement).appendChild(script);
-        script.remove();
-      });
-    } catch (e) {
-      return false;
-    }
-  }
-
-  /**
-   * Reorders draggable / sortable options on the webpage into targetSequence.
-   * Employs keyboard navigation (react-beautiful-dnd), mouse/pointer drag simulation,
-   * and HTML5 DragEvent dispatches. Verifies actual DOM element positions before finishing.
+   * Reorders a drag-and-drop list into `targetSequence` (option IDs, first to last).
+   *
+   * Works through the page's own drag library so its state really changes:
+   *   1. Keyboard dragging (react-beautiful-dnd / hello-pangea / dnd-kit all support it)
+   *   2. Pointer + mouse drag with movement past the drag threshold
+   *   3. HTML5 drag events (SortableJS, native draggable lists)
+   * After every move it waits for the list to settle before judging the result, so one
+   * technique finishing late is never followed by a second technique moving the item again.
+   *
+   * The old version started by moving the DOM nodes with appendChild. That made the list
+   * *look* right while the portal's state stayed unchanged, so the original order was
+   * submitted and React could crash on the next render.
    */
   public async reorderOptions(
     targetSequence: string[],
     options: OptionItem[] = [],
-  ): Promise<{
-    success: boolean;
-    isVerifiedCorrect: boolean;
-    verifiedOrder: string[];
-    message: string;
-  }> {
-    if (!targetSequence || targetSequence.length === 0) {
-      return {
-        success: false,
-        isVerifiedCorrect: false,
-        verifiedOrder: [],
-        message: 'No target sequence provided for reordering.',
-      };
-    }
-
-    const cleanTargets = targetSequence
-      .flatMap((id) => id.split(/[,;\->\s]+/))
+  ): Promise<{ success: boolean; isVerifiedCorrect: boolean; verifiedOrder: string[]; message: string }> {
+    const targets = targetSequence
+      .flatMap((id) => String(id).split(/[,;\->\s]+/))
       .map((s) => s.trim())
       .filter(Boolean);
-
-    // 0. Primary Strategy: Try page context React Beautiful DnD reordering
-    await this.executePageContextReorder(cleanTargets, options);
-
-    // 1. Locate all draggable elements currently in DOM
-    const getDraggableElements = (): HTMLElement[] => {
-      // Strategy 0: react-beautiful-dnd droppable container children
-      const droppable = document.querySelector<HTMLElement>('[data-rbd-droppable-id], [data-rfd-droppable-id]');
-      if (droppable && droppable.children.length >= 2) {
-        const directChildren = Array.from(droppable.children) as HTMLElement[];
-        if (directChildren.length >= 2) return directChildren;
-      }
-
-      // Strategy A: react-beautiful-dnd items
-      let items = Array.from(
-        document.querySelectorAll<HTMLElement>('[data-rbd-draggable-id], [data-rfd-draggable-id]'),
-      );
-      if (items.length >= 2) return items;
-
-      // Strategy B: Drag handle parents
-      const handles = Array.from(
-        document.querySelectorAll<HTMLElement>(
-          '[data-rbd-drag-handle-draggable-id], [data-rfd-drag-handle-draggable-id]',
-        ),
-      );
-      if (handles.length >= 2) {
-        const fromHandles = handles
-          .map((h) => h.closest<HTMLElement>('[data-rbd-draggable-id], [data-rfd-draggable-id]') || (h.parentElement as HTMLElement))
-          .filter(Boolean);
-        if (fromHandles.length >= 2) return fromHandles;
-      }
-
-      // Strategy C: HTML5 draggable="true"
-      items = Array.from(document.querySelectorAll<HTMLElement>('[draggable="true"]'));
-      if (items.length >= 2) return items;
-
-      // Strategy D: option elementSelectors
-      if (options.length >= 2) {
-        const fromSelectors = options
-          .map((o) => (o.elementSelector ? document.querySelector<HTMLElement>(o.elementSelector) : null))
-          .filter(Boolean) as HTMLElement[];
-        if (fromSelectors.length >= 2) return fromSelectors;
-      }
-
-      // Strategy E: classes
-      items = Array.from(
-        document.querySelectorAll<HTMLElement>(
-          '[class*="draggable" i], [class*="drag-item" i], [class*="sortable" i], [class*="reorder" i]',
-        ),
-      ).filter((el) => {
-        const t = (el.textContent || '').trim().toLowerCase();
-        return !t.startsWith('submit') && !t.startsWith('show answer') && !t.startsWith('skip') && el.clientHeight > 15;
-      });
-      return items;
-    };
-
-    let domItems = getDraggableElements();
-    if (domItems.length < 2) {
+    if (targets.length < 2) {
+      return { success: false, isVerifiedCorrect: false, verifiedOrder: [], message: 'No target sequence provided for reordering.' };
+    }
+    if (document.hidden) {
       return {
         success: false,
         isVerifiedCorrect: false,
         verifiedOrder: [],
-        message: 'Could not find draggable items on the webpage.',
+        message: 'Drag and drop needs this tab to be visible (browsers pause page animations in background tabs).',
       };
     }
 
-    // Helper: Normalize strings for reliable text matching
-    const normalizeForMatch = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const ITEM_SELECTOR =
+      '[data-rbd-draggable-id], [data-rfd-draggable-id], [aria-roledescription="sortable"], [aria-roledescription="draggable"], [draggable="true"]';
+    const HANDLE_SELECTOR =
+      '[data-rbd-drag-handle-draggable-id], [data-rfd-drag-handle-draggable-id], [aria-roledescription="sortable"], [aria-roledescription="draggable"], [class*="handle" i], [class*="grip" i]';
+    const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
 
-    // Helper: Map each current DOM element to an option ID by matching text
-    const getElementId = (el: HTMLElement): string => {
-      const normEl = normalizeForMatch(el.textContent || '');
-      for (const opt of options) {
-        const normOpt = normalizeForMatch(opt.text);
-        if (normOpt && (normEl.includes(normOpt) || normOpt.includes(normEl))) {
-          return opt.id;
+    const getItems = (): HTMLElement[] => {
+      const droppable = document.querySelector<HTMLElement>('[data-rbd-droppable-id], [data-rfd-droppable-id]');
+      if (droppable) {
+        const children = (Array.from(droppable.children) as HTMLElement[]).filter((c) => isRendered(c) && norm(c.textContent || ''));
+        if (children.length >= 2) return children;
+      }
+      let items = Array.from(document.querySelectorAll<HTMLElement>(ITEM_SELECTOR)).filter((el) => isRendered(el));
+      // Keep the outermost draggable when both an item and its handle carry markers
+      items = items.filter((el) => !items.some((other) => other !== el && other.contains(el)));
+      if (items.length >= 2) return items.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+
+      const fromSelectors = options
+        .map((o) => {
+          try {
+            return o.elementSelector ? document.querySelector<HTMLElement>(o.elementSelector) : null;
+          } catch {
+            return null;
+          }
+        })
+        .filter((el): el is HTMLElement => !!el && isRendered(el));
+      return fromSelectors.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+    };
+
+    // Map a list item to the option whose text it contains best (longest match wins, so
+    // "Load programs" never claims the item "Load multiple programs into memory").
+    const optionNorms = options.map((o) => ({ id: o.id, n: norm(o.text) })).filter((o) => o.n.length > 0);
+    const idOf = (el: HTMLElement): string => {
+      const t = norm(el.textContent || '');
+      let best = '';
+      let bestLen = 0;
+      for (const o of optionNorms) {
+        if (t.includes(o.n) && o.n.length > bestLen) {
+          best = o.id;
+          bestLen = o.n.length;
         }
       }
-      return '';
+      return best;
+    };
+    const currentOrder = () => getItems().map(idOf);
+    const isDone = () => {
+      const order = currentOrder();
+      return order.length === targets.length && order.every((id, i) => id === targets[i]);
     };
 
-    // Helper: Get current order of option IDs in DOM from top to bottom
-    const getCurrentOrder = (): string[] => {
-      const currentItems = getDraggableElements();
-      return currentItems.map((el, idx) => {
-        const matched = getElementId(el);
-        return matched || String(idx + 1);
-      });
-    };
+    const handleOf = (el: HTMLElement): HTMLElement =>
+      el.matches(HANDLE_SELECTOR) ? el : el.querySelector<HTMLElement>(HANDLE_SELECTOR) || el;
 
-    const findHandle = (el: HTMLElement): HTMLElement => {
-      return (
-        el.querySelector<HTMLElement>(
-          '[data-rbd-drag-handle-draggable-id], [data-rfd-drag-handle-draggable-id], [class*="handle" i], [class*="grip" i], svg, [role="button"]',
-        ) || el
-      );
-    };
-
-    // Method 1: Mouse and Pointer Drag simulation with interpolated movement and window events
-    const tryPointerMouseDrag = async (
-      sourceEl: HTMLElement,
-      targetEl: HTMLElement,
-      isMovingDown: boolean,
-    ): Promise<void> => {
-      try {
-        const sourceHandle = findHandle(sourceEl);
-        if (typeof sourceHandle.scrollIntoView === 'function') {
-          sourceHandle.scrollIntoView({ behavior: 'instant', block: 'nearest' });
+    const waitForChange = async (before: string, timeoutMs = 1500): Promise<boolean> => {
+      const start = Date.now();
+      while (Date.now() - start < timeoutMs) {
+        await sleep(100);
+        if (currentOrder().join(',') !== before) {
+          await sleep(350); // let the drop animation finish before the next move
+          return true;
         }
-
-        const sRect = sourceHandle.getBoundingClientRect();
-        const tRect = targetEl.getBoundingClientRect();
-
-        const startX = sRect.left + sRect.width / 2;
-        const startY = sRect.top + sRect.height / 2;
-        const endX = tRect.left + tRect.width / 2;
-        const endY = isMovingDown ? tRect.bottom + 8 : tRect.top - 8;
-
-        const pointerId = 1;
-
-        // 1. Pointer & Mouse down on source handle
-        sourceHandle.dispatchEvent(
-          new PointerEvent('pointerdown', {
-            bubbles: true,
-            cancelable: true,
-            view: window,
-            clientX: startX,
-            clientY: startY,
-            button: 0,
-            buttons: 1,
-            pointerId,
-            isPrimary: true,
-          }),
-        );
-        sourceHandle.dispatchEvent(
-          new MouseEvent('mousedown', {
-            bubbles: true,
-            cancelable: true,
-            view: window,
-            clientX: startX,
-            clientY: startY,
-            button: 0,
-            buttons: 1,
-          }),
-        );
-        await new Promise((r) => setTimeout(r, 40));
-
-        // 2. Drag threshold overcome: move 8px
-        const deltaYInit = isMovingDown ? 10 : -10;
-        window.dispatchEvent(
-          new PointerEvent('pointermove', {
-            bubbles: true,
-            cancelable: true,
-            view: window,
-            clientX: startX,
-            clientY: startY + deltaYInit,
-            button: 0,
-            buttons: 1,
-            pointerId,
-            isPrimary: true,
-          }),
-        );
-        window.dispatchEvent(
-          new MouseEvent('mousemove', {
-            bubbles: true,
-            cancelable: true,
-            view: window,
-            clientX: startX,
-            clientY: startY + deltaYInit,
-            button: 0,
-            buttons: 1,
-          }),
-        );
-        await new Promise((r) => setTimeout(r, 30));
-
-        // 3. Interpolate movement to destination
-        const steps = 8;
-        for (let s = 1; s <= steps; s++) {
-          const curX = startX + (endX - startX) * (s / steps);
-          const curY = startY + (endY - startY) * (s / steps);
-
-          const pMove = new PointerEvent('pointermove', {
-            bubbles: true,
-            cancelable: true,
-            view: window,
-            clientX: curX,
-            clientY: curY,
-            button: 0,
-            buttons: 1,
-            pointerId,
-            isPrimary: true,
-          });
-          const mMove = new MouseEvent('mousemove', {
-            bubbles: true,
-            cancelable: true,
-            view: window,
-            clientX: curX,
-            clientY: curY,
-            button: 0,
-            buttons: 1,
-          });
-
-          window.dispatchEvent(pMove);
-          window.dispatchEvent(mMove);
-          targetEl.dispatchEvent(pMove);
-          targetEl.dispatchEvent(mMove);
-
-          await new Promise((r) => setTimeout(r, 25));
-        }
-
-        await new Promise((r) => setTimeout(r, 40));
-
-        // 4. Pointer & Mouse up
-        const pUp = new PointerEvent('pointerup', {
-          bubbles: true,
-          cancelable: true,
-          view: window,
-          clientX: endX,
-          clientY: endY,
-          button: 0,
-          buttons: 0,
-          pointerId,
-          isPrimary: true,
-        });
-        const mUp = new MouseEvent('mouseup', {
-          bubbles: true,
-          cancelable: true,
-          view: window,
-          clientX: endX,
-          clientY: endY,
-          button: 0,
-          buttons: 0,
-        });
-
-        targetEl.dispatchEvent(pUp);
-        targetEl.dispatchEvent(mUp);
-        window.dispatchEvent(pUp);
-        window.dispatchEvent(mUp);
-        document.dispatchEvent(mUp);
-
-        await new Promise((r) => setTimeout(r, 120));
-      } catch (e) {}
-    };
-
-    // Method 2: Accessible Keyboard simulation (react-beautiful-dnd standard)
-    const tryKeyboardDrag = async (
-      sourceEl: HTMLElement,
-      stepsCount: number,
-      isMovingDown: boolean,
-    ): Promise<void> => {
-      try {
-        const sourceHandle = findHandle(sourceEl);
-        sourceHandle.focus?.();
-        await new Promise((r) => setTimeout(r, 40));
-
-        const spaceDown = new KeyboardEvent('keydown', {
-          key: ' ',
-          code: 'Space',
-          keyCode: 32,
-          which: 32,
-          bubbles: true,
-          cancelable: true,
-        });
-        sourceHandle.dispatchEvent(spaceDown);
-        await new Promise((r) => setTimeout(r, 80));
-
-        const arrowKey = isMovingDown ? 'ArrowDown' : 'ArrowUp';
-        const arrowCode = isMovingDown ? 40 : 38;
-
-        for (let s = 0; s < stepsCount; s++) {
-          const arrowEvt = new KeyboardEvent('keydown', {
-            key: arrowKey,
-            code: arrowKey,
-            keyCode: arrowCode,
-            which: arrowCode,
-            bubbles: true,
-            cancelable: true,
-          });
-          sourceHandle.dispatchEvent(arrowEvt);
-          await new Promise((r) => setTimeout(r, 60));
-        }
-
-        const spaceDrop = new KeyboardEvent('keydown', {
-          key: ' ',
-          code: 'Space',
-          keyCode: 32,
-          which: 32,
-          bubbles: true,
-          cancelable: true,
-        });
-        sourceHandle.dispatchEvent(spaceDrop);
-        await new Promise((r) => setTimeout(r, 120));
-      } catch (e) {}
-    };
-
-    // Method 3: HTML5 native drag and drop
-    const tryHtml5Drag = async (sourceEl: HTMLElement, targetEl: HTMLElement): Promise<void> => {
-      try {
-        let dt: DataTransfer;
-        try {
-          dt = new DataTransfer();
-        } catch (e) {
-          dt = {} as any;
-        }
-        if (dt.setData) {
-          try {
-            dt.setData('text/plain', sourceEl.textContent || '');
-          } catch (e) {}
-        }
-
-        sourceEl.dispatchEvent(new DragEvent('dragstart', { bubbles: true, cancelable: true, dataTransfer: dt }));
-        await new Promise((r) => setTimeout(r, 40));
-
-        targetEl.dispatchEvent(new DragEvent('dragenter', { bubbles: true, cancelable: true, dataTransfer: dt }));
-        targetEl.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: dt }));
-        await new Promise((r) => setTimeout(r, 40));
-
-        targetEl.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt }));
-        await new Promise((r) => setTimeout(r, 40));
-
-        sourceEl.dispatchEvent(new DragEvent('dragend', { bubbles: true, cancelable: true, dataTransfer: dt }));
-        await new Promise((r) => setTimeout(r, 120));
-      } catch (e) {}
-    };
-
-    // Helper: move single item from source to destination position using multi-strategy fallback
-    const moveItem = async (
-      sourceEl: HTMLElement,
-      targetEl: HTMLElement,
-      fromIdx: number,
-      toIdx: number,
-    ): Promise<boolean> => {
-      const isMovingDown = toIdx > fromIdx;
-      const steps = Math.abs(toIdx - fromIdx);
-      const beforeOrder = getCurrentOrder().join(',');
-
-      // 1. Try Pointer + Mouse Drag
-      await tryPointerMouseDrag(sourceEl, targetEl, isMovingDown);
-      let afterOrder = getCurrentOrder().join(',');
-      if (afterOrder !== beforeOrder) return true;
-
-      // 2. Try Keyboard Drag
-      await tryKeyboardDrag(sourceEl, steps, isMovingDown);
-      afterOrder = getCurrentOrder().join(',');
-      if (afterOrder !== beforeOrder) return true;
-
-      // 3. Try HTML5 Drag
-      await tryHtml5Drag(sourceEl, targetEl);
-      afterOrder = getCurrentOrder().join(',');
-      if (afterOrder !== beforeOrder) return true;
-
+      }
       return false;
     };
 
-    // Iteratively arrange items in target sequence
-    for (let pass = 0; pass < 2; pass++) {
-      let anyMovedInPass = false;
+    const key = (el: HTMLElement, k: string, code: string, keyCode: number) => {
+      el.dispatchEvent(new KeyboardEvent('keydown', { key: k, code, keyCode, which: keyCode, bubbles: true, cancelable: true }));
+    };
 
-      for (let targetIndex = 0; targetIndex < cleanTargets.length; targetIndex++) {
-        const desiredId = cleanTargets[targetIndex];
-        domItems = getDraggableElements();
-
-        // Check if item at targetIndex already matches desiredId
-        if (targetIndex < domItems.length && getElementId(domItems[targetIndex]) === desiredId) {
-          continue;
-        }
-
-        // Find which DOM item currently has desiredId
-        let currentItemIndex = -1;
-        for (let idx = 0; idx < domItems.length; idx++) {
-          const id = getElementId(domItems[idx]);
-          if (id === desiredId || (!id && idx === parseInt(desiredId, 10) - 1)) {
-            currentItemIndex = idx;
-            break;
-          }
-        }
-
-        if (currentItemIndex >= 0 && currentItemIndex !== targetIndex && targetIndex < domItems.length) {
-          const sourceItem = domItems[currentItemIndex];
-          const destItem = domItems[targetIndex];
-          const moved = await moveItem(sourceItem, destItem, currentItemIndex, targetIndex);
-          if (moved) {
-            anyMovedInPass = true;
-          }
-          await new Promise((r) => setTimeout(r, 120));
-        }
+    const keyboardMove = async (el: HTMLElement, from: number, to: number) => {
+      const handle = handleOf(el);
+      handle.scrollIntoView({ block: 'center' });
+      handle.focus();
+      await sleep(80);
+      key(handle, ' ', 'Space', 32);
+      await sleep(250);
+      const down = to > from;
+      for (let s = 0; s < Math.abs(to - from); s++) {
+        key(handle, down ? 'ArrowDown' : 'ArrowUp', down ? 'ArrowDown' : 'ArrowUp', down ? 40 : 38);
+        await sleep(220);
       }
+      key(handle, ' ', 'Space', 32);
+    };
 
-      // Check if current order matches cleanTargets
-      const currentOrder = getCurrentOrder();
-      if (
-        currentOrder.length === cleanTargets.length &&
-        currentOrder.every((id, i) => id === cleanTargets[i])
-      ) {
-        break;
+    const pointerMove = async (el: HTMLElement, dest: HTMLElement, down: boolean) => {
+      const handle = handleOf(el);
+      handle.scrollIntoView({ block: 'center' });
+      await sleep(80);
+      const s = handle.getBoundingClientRect();
+      const d = dest.getBoundingClientRect();
+      const x0 = s.left + s.width / 2;
+      const y0 = s.top + s.height / 2;
+      const x1 = d.left + d.width / 2;
+      const y1 = down ? d.bottom - 4 : d.top + 4;
+      const base = { bubbles: true, cancelable: true, view: window, button: 0, pointerId: 1, isPrimary: true, pointerType: 'mouse' };
+
+      handle.dispatchEvent(new PointerEvent('pointerdown', { ...base, clientX: x0, clientY: y0, buttons: 1 }));
+      handle.dispatchEvent(new MouseEvent('mousedown', { ...base, clientX: x0, clientY: y0, buttons: 1 }));
+      await sleep(60);
+      const steps = 12;
+      for (let i = 1; i <= steps; i++) {
+        const x = x0 + ((x1 - x0) * i) / steps;
+        const y = y0 + ((y1 - y0) * i) / steps;
+        const at = document.elementFromPoint(x, y) || window;
+        for (const target of [at, window] as EventTarget[]) {
+          target.dispatchEvent(new PointerEvent('pointermove', { ...base, clientX: x, clientY: y, buttons: 1 }));
+          target.dispatchEvent(new MouseEvent('mousemove', { ...base, clientX: x, clientY: y, buttons: 1 }));
+        }
+        await sleep(40);
       }
+      await sleep(120);
+      const at = document.elementFromPoint(x1, y1) || window;
+      for (const target of [at, window] as EventTarget[]) {
+        target.dispatchEvent(new PointerEvent('pointerup', { ...base, clientX: x1, clientY: y1, buttons: 0 }));
+        target.dispatchEvent(new MouseEvent('mouseup', { ...base, clientX: x1, clientY: y1, buttons: 0 }));
+      }
+    };
 
-      if (!anyMovedInPass) {
-        break;
+    const html5Move = async (el: HTMLElement, dest: HTMLElement, down: boolean) => {
+      const dt = new DataTransfer();
+      dt.setData('text/plain', el.textContent || '');
+      const s = el.getBoundingClientRect();
+      const d = dest.getBoundingClientRect();
+      const x = d.left + d.width / 2;
+      const y = down ? d.bottom - 4 : d.top + 4;
+      el.dispatchEvent(new DragEvent('dragstart', { bubbles: true, cancelable: true, dataTransfer: dt, clientX: s.left + 5, clientY: s.top + 5 }));
+      await sleep(50);
+      for (let i = 0; i < 3; i++) {
+        dest.dispatchEvent(new DragEvent('dragenter', { bubbles: true, cancelable: true, dataTransfer: dt, clientX: x, clientY: y }));
+        dest.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: dt, clientX: x, clientY: y }));
+        await sleep(50);
+      }
+      dest.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt, clientX: x, clientY: y }));
+      el.dispatchEvent(new DragEvent('dragend', { bubbles: true, cancelable: true, dataTransfer: dt, clientX: x, clientY: y }));
+    };
+
+    const usesRbd = !!document.querySelector('[data-rbd-drag-handle-draggable-id], [data-rfd-drag-handle-draggable-id], [aria-roledescription="sortable"]');
+    const techniques: ('keyboard' | 'pointer' | 'html5')[] = usesRbd
+      ? ['keyboard', 'pointer', 'html5']
+      : ['pointer', 'html5', 'keyboard'];
+    let working: 'keyboard' | 'pointer' | 'html5' | null = null;
+
+    // Selection-sort: put the right item at each position, top to bottom
+    let movesLeft = targets.length * 3;
+    for (let pos = 0; pos < targets.length && movesLeft > 0; pos++) {
+      let items = getItems();
+      if (items.length !== targets.length) break;
+      let from = items.map(idOf).indexOf(targets[pos]);
+      if (from < 0 || from === pos) continue;
+
+      type Technique = 'keyboard' | 'pointer' | 'html5';
+      const tryOrder: Technique[] = working ? [working, ...techniques.filter((t) => t !== working)] : techniques;
+      for (const technique of tryOrder) {
+        movesLeft--;
+        items = getItems();
+        from = items.map(idOf).indexOf(targets[pos]);
+        if (from === pos) break;
+        const before = items.map(idOf).join(',');
+        const down = pos > from;
+        if (technique === 'keyboard') await keyboardMove(items[from], from, pos);
+        else if (technique === 'pointer') await pointerMove(items[from], items[pos], down);
+        else await html5Move(items[from], items[pos], down);
+
+        if (await waitForChange(before)) {
+          working = technique;
+          // If the item did not land exactly, retry this position on the next pass
+          if (getItems().map(idOf).indexOf(targets[pos]) !== pos) pos--;
+          break;
+        }
       }
     }
 
-    // Verify ground-truth DOM state
-    const finalOrder = getCurrentOrder();
-    const isVerifiedCorrect =
-      finalOrder.length === cleanTargets.length &&
-      finalOrder.every((id, idx) => id === cleanTargets[idx]);
-
+    const finalOrder = currentOrder();
+    const ok = isDone();
     return {
-      success: isVerifiedCorrect,
-      isVerifiedCorrect,
+      success: ok,
+      isVerifiedCorrect: ok,
       verifiedOrder: finalOrder,
-      message: isVerifiedCorrect
-        ? `Successfully arranged steps in sequence: [${cleanTargets.join(' → ')}]`
-        : `Step reorder could not be fully verified on page. Current: [${finalOrder.join(' → ')}], Expected: [${cleanTargets.join(' → ')}]`,
+      message: ok
+        ? `Arranged in sequence: [${targets.join(' → ')}]${working ? ` using ${working} drag` : ''}`
+        : `Could not finish the drag and drop. Page order: [${finalOrder.join(' → ')}], wanted: [${targets.join(' → ')}]`,
     };
   }
 
   /**
-   * Finds and clicks the Submit button on the webpage with dynamic wait if disabled.
+   * Finds an enabled, visible Submit or Next control.
+   *
+   * Matching is strict on purpose. The old finder clicked anything whose text merely contained
+   * "next" or started with "submit": links like "Next.js docs", "Submit Test" or "Submit
+   * Assessment". Those end the attempt or navigate away, which silently killed the Auto-Loop.
    */
-  public async clickSubmitButton(timeoutMs: number = 5000): Promise<{ success: boolean; message: string }> {
-    const submitSelectors = [
-      'button',
-      'input[type="button"]',
-      'input[type="submit"]',
-      'div[role="button"]',
-      'a.btn',
-    ];
+  public findActionButton(kind: 'submit' | 'next', near?: Element | null): HTMLElement | null {
+    const SUBMIT_TEXT = /^(submit|submit answer|check|check answer)$/;
+    const NEXT_TEXT = /^(next|next question|save (and|&) next|save next|continue|proceed|go to next( question)?)$/;
+    const ARROWS = new Set(['→', '›', '»', '>', '->', '⟶']);
 
+    const labelOf = (btn: HTMLElement) =>
+      (btn.innerText || btn.textContent || btn.getAttribute('value') || btn.getAttribute('aria-label') || '')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    const matches = Array.from(
+      document.querySelectorAll<HTMLElement>('button, input[type="button"], input[type="submit"], [role="button"], a'),
+    ).filter((btn) => {
+      if (btn.closest('#ai-mcq-assistant-root')) return false;
+      if (btn.hasAttribute('disabled') || (btn as any).disabled || btn.getAttribute('aria-disabled') === 'true') return false;
+      if (btn.tagName === 'A') {
+        if (kind === 'submit') return false;
+        const href = btn.getAttribute('href') || '';
+        // A real link navigates away and ends the loop; only in-page links are allowed
+        if (href && !href.startsWith('#') && !href.toLowerCase().startsWith('javascript:')) return false;
+      }
+      const raw = labelOf(btn);
+      if (!raw || raw.length > 30) return false;
+      const norm = raw
+        .toLowerCase()
+        .replace(/[^a-z& ]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      const textOk = kind === 'submit' ? SUBMIT_TEXT.test(norm) : NEXT_TEXT.test(norm) || (!norm && ARROWS.has(raw));
+      return textOk && isRendered(btn);
+    });
+
+    if (matches.length <= 1 || !near) return matches[0] || null;
+
+    // Several candidates: take the one closest to the question
+    const r = near.getBoundingClientRect();
+    const cx = r.left + r.width / 2;
+    const cy = r.top + r.height / 2;
+    const dist = (el: HTMLElement) => {
+      const b = el.getBoundingClientRect();
+      return Math.hypot(b.left + b.width / 2 - cx, b.top + b.height / 2 - cy);
+    };
+    return matches.sort((a, b) => dist(a) - dist(b))[0];
+  }
+
+  private async waitAndClickAction(
+    kind: 'submit' | 'next',
+    timeoutMs: number,
+    near?: Element | null,
+  ): Promise<{ success: boolean; message: string }> {
     const startTime = Date.now();
     while (Date.now() - startTime < timeoutMs) {
-      const candidates = Array.from(document.querySelectorAll<HTMLElement>(submitSelectors.join(', ')));
-      for (const btn of candidates) {
-        const text = (btn.textContent || btn.getAttribute('value') || '').trim().toLowerCase();
-        if (text === 'submit' || text.startsWith('submit')) {
-          // Check if disabled
-          const isDisabled = btn.hasAttribute('disabled') || (btn as any).disabled;
-          if (!isDisabled) {
-            if (typeof btn.scrollIntoView === 'function') {
-              btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            }
-            btn.click();
-            return {
-              success: true,
-              message: 'Clicked SUBMIT button.',
-            };
-          }
+      const btn = this.findActionButton(kind, near);
+      if (btn) {
+        if (typeof btn.scrollIntoView === 'function') {
+          btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
         }
+        btn.click();
+        const label = (btn.innerText || btn.textContent || btn.getAttribute('value') || '').trim();
+        return { success: true, message: `Clicked ${kind.toUpperCase()} button: "${label}"` };
       }
-      await new Promise((r) => setTimeout(r, 150));
+      await sleep(200);
     }
-
     return {
       success: false,
-      message: 'No active SUBMIT button found within timeout.',
+      message: kind === 'submit' ? 'No active SUBMIT button found within timeout.' : 'Timed out waiting for NEXT button.',
     };
   }
 
   /**
-   * Dynamically waits until the NEXT button appears in the DOM and clicks it.
-   * Completely eliminates static timeout errors when portal answer submission takes time.
+   * Finds and clicks the Submit button on the webpage, waiting while it is disabled.
    */
-  public async waitForAndClickNextButton(timeoutMs: number = 15000): Promise<{ success: boolean; message: string }> {
-    const nextSelectors = [
-      'button',
-      'input[type="button"]',
-      'input[type="submit"]',
-      'div[role="button"]',
-      'a.btn',
-      'a',
-    ];
+  public async clickSubmitButton(timeoutMs: number = 5000, near?: Element | null): Promise<{ success: boolean; message: string }> {
+    return this.waitAndClickAction('submit', timeoutMs, near);
+  }
 
-    const startTime = Date.now();
-    while (Date.now() - startTime < timeoutMs) {
-      const candidates = Array.from(document.querySelectorAll<HTMLElement>(nextSelectors.join(', ')));
-      for (const btn of candidates) {
-        const text = (btn.textContent || btn.getAttribute('value') || '').trim().toLowerCase();
-        if (
-          text === 'next' ||
-          text === 'next question' ||
-          text.startsWith('next') ||
-          text.includes('next') ||
-          text.includes('continue') ||
-          text === '→'
-        ) {
-          // Ensure element is visible
-          const style = typeof window !== 'undefined' && window.getComputedStyle ? window.getComputedStyle(btn) : (btn.style as any);
-          const isHidden = style && (style.display === 'none' || style.visibility === 'hidden');
-          const isDisabled = btn.hasAttribute('disabled') || (btn as any).disabled;
-
-          if (!isHidden && !isDisabled) {
-            if (typeof btn.scrollIntoView === 'function') {
-              btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            }
-            btn.click();
-            return {
-              success: true,
-              message: `Detected and clicked NEXT button: "${text}"`,
-            };
-          }
-        }
-      }
-      await new Promise((r) => setTimeout(r, 150));
-    }
-
-    return {
-      success: false,
-      message: 'Timed out waiting for NEXT button to appear after submission.',
-    };
+  /**
+   * Waits until a NEXT button appears (portals often show it only after submitting) and clicks it.
+   */
+  public async waitForAndClickNextButton(timeoutMs: number = 15000, near?: Element | null): Promise<{ success: boolean; message: string }> {
+    return this.waitAndClickAction('next', timeoutMs, near);
   }
 
   /**
@@ -1164,41 +835,15 @@ export class DOMInteractionManager {
    * Finds and clicks the Next Question / Continue button immediately if present.
    */
   public navigateNextQuestion(): { success: boolean; message: string } {
-    const nextSelectors = [
-      'button',
-      'input[type="button"]',
-      'input[type="submit"]',
-      'div[role="button"]',
-      'a.btn',
-      'a',
-    ];
-
-    const candidates = Array.from(document.querySelectorAll<HTMLElement>(nextSelectors.join(', ')));
-    for (const btn of candidates) {
-      const text = (btn.textContent || btn.getAttribute('value') || '').trim().toLowerCase();
-      if (
-        text === 'next' ||
-        text === 'next question' ||
-        text.includes('next') ||
-        text.includes('continue') ||
-        text.includes('forward') ||
-        text === '→'
-      ) {
-        if (typeof btn.scrollIntoView === 'function') {
-          btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        }
-        btn.click();
-        return {
-          success: true,
-          message: `Clicked navigation button: "${text}"`,
-        };
-      }
+    const btn = this.findActionButton('next');
+    if (!btn) {
+      return { success: false, message: 'No suitable Next/Continue button detected on page.' };
     }
-
-    return {
-      success: false,
-      message: 'No suitable Next/Continue button detected on page.',
-    };
+    if (typeof btn.scrollIntoView === 'function') {
+      btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+    btn.click();
+    return { success: true, message: `Clicked navigation button: "${(btn.innerText || btn.textContent || '').trim()}"` };
   }
 
   private findOptionFallback(optionId: string): HTMLElement | null {

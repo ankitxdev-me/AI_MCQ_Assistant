@@ -39,6 +39,29 @@ export const OptionItemSchema = z.object({
   isPreSelected: z.boolean().optional(),
 });
 
+/** A visual element that belongs to a question (diagram, code screenshot, option image). */
+export interface QuestionImageRef {
+  kind: 'img' | 'svg' | 'canvas';
+  /** Image URL for kind 'img'. */
+  src?: string;
+  /** What the image is, e.g. "Question figure" or "Option B image". */
+  label: string;
+}
+
+/** Image bytes sent to the AI provider. */
+export interface QuestionImagePayload {
+  mimeType: string;
+  /** Base64 without the data: prefix. */
+  data: string;
+  label?: string;
+}
+
+export const QuestionImagePayloadSchema = z.object({
+  mimeType: z.string().regex(/^image\/(png|jpeg|webp|heic|heif)$/),
+  data: z.string().min(1),
+  label: z.string().max(200).optional(),
+});
+
 export type QuestionType = 'SINGLE_CHOICE' | 'MULTIPLE_CHOICE' | 'ORDERING' | 'CODING' | 'DESCRIPTIVE';
 
 export type QuestionCategory =
@@ -82,6 +105,10 @@ export interface ExtractedQuestion {
   aiAnswer?: AIAnswerResult;
   elementSelector?: string;
   detectedAt?: string;
+  /** Images, diagrams or canvases that are part of the question. */
+  images?: QuestionImageRef[];
+  /** True when the question relies on visuals the text alone cannot convey. */
+  hasVisualContent?: boolean;
   status: QuestionStatus;
 }
 
@@ -142,6 +169,12 @@ export interface AIAnswerResult {
   alternative_options?: string[];
   reasoning?: string;
   webEvidence?: string[];
+  /** Which custom-knowledge notes were active when this answer was made. Stale keys are not served from cache. */
+  knowledgeKey?: string;
+  /** True for answers confirmed by the portal itself (always safe to reuse). */
+  verified?: boolean;
+  /** Number of images the model looked at. */
+  imagesUsed?: number;
 }
 
 export const AIAnswerResultSchema = z.object({
@@ -155,10 +188,17 @@ export const AIAnswerResultSchema = z.object({
   alternative_options: z.array(z.string()).optional(),
   reasoning: z.string().optional(),
   webEvidence: z.array(z.string()).optional(),
+  knowledgeKey: z.string().optional(),
+  verified: z.boolean().optional(),
+  imagesUsed: z.number().optional(),
 });
 
 export interface SolveQuestionPayload {
-  sessionId: string;
+  /** Omit to let the backend open a session for this page automatically. */
+  sessionId?: string;
+  pageUrl?: string;
+  pageTitle?: string;
+  enableWebSearch?: boolean;
   question: string;
   options: { id: string; text: string }[];
   questionFingerprint: string;
@@ -168,28 +208,39 @@ export interface SolveQuestionPayload {
   isMultipleChoiceMultipleAnswer?: boolean;
   isOrderingQuestion?: boolean;
   questionType?: QuestionType;
+  images?: QuestionImagePayload[];
 }
 
 export const SolveQuestionPayloadSchema = z.object({
-  sessionId: z.string().min(1),
+  sessionId: z.string().min(1).optional(),
+  pageUrl: z.string().optional(),
+  pageTitle: z.string().optional(),
+  enableWebSearch: z.boolean().optional(),
   question: z.string().min(1),
+  // Empty for typed-answer questions (questionType 'DESCRIPTIVE')
   options: z.array(
     z.object({
       id: z.string().min(1),
       text: z.string(),
     }),
-  ).min(1),
+  ),
   questionFingerprint: z.string().min(1),
   questionNumber: z.number().optional(),
   forceFresh: z.boolean().optional(),
   webSearchEvidence: z.array(z.string()).optional(),
   isMultipleChoiceMultipleAnswer: z.boolean().optional(),
   isOrderingQuestion: z.boolean().optional(),
-  questionType: z.enum(['SINGLE_CHOICE', 'MULTIPLE_CHOICE', 'ORDERING']).optional(),
+  questionType: z.enum(['SINGLE_CHOICE', 'MULTIPLE_CHOICE', 'ORDERING', 'CODING', 'DESCRIPTIVE']).optional(),
+  images: z.array(QuestionImagePayloadSchema).max(8).optional(),
+}).refine((p) => p.options.length > 0 || p.questionType === 'DESCRIPTIVE', {
+  message: 'options are required unless questionType is DESCRIPTIVE (typed answer)',
+  path: ['options'],
 });
 
 export interface SolveQuestionResponse {
   success: boolean;
+  /** Session the answer was recorded under (may be newly created). */
+  sessionId: string;
   questionId: string;
   answer: AIAnswerResult;
   cached: boolean;

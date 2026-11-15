@@ -39,7 +39,9 @@ export class ConfigService {
 
     const isConfigured = hasDbKey || hasEnvFallback;
     const selectedModel =
+
       dbModelRow?.value || process.env.GEMINI_DEFAULT_MODEL || 'gemini-flash-lite-latest';
+
 
     return {
       configured: isConfigured,
@@ -72,10 +74,10 @@ export class ConfigService {
     const dbModelRow = this.db.queryOne<{ value: string }>(
       `SELECT value FROM configs WHERE key = 'gemini_model'`,
     );
-    return dbModelRow?.value || process.env.GEMINI_DEFAULT_MODEL || 'gemini-3.1-flash-lite';
+    return dbModelRow?.value || process.env.GEMINI_DEFAULT_MODEL || GeminiProvider.DEFAULT_MODEL;
   }
 
-  async saveGeminiConfig(apiKey: string, model: string = 'gemini-3.1-flash-lite') {
+  async saveGeminiConfig(apiKey: string, model: string = GeminiProvider.DEFAULT_MODEL) {
     const now = new Date().toISOString();
     this.db.run(
       `INSERT OR REPLACE INTO configs (key, value, updated_at) VALUES ('gemini_api_key', ?, ?)`,

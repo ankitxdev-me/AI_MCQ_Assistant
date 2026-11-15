@@ -1,4 +1,4 @@
-import { AIAnswerResult, QuestionType } from '@ai-mcq/shared-types';
+import { AIAnswerResult, QuestionType, QuestionImagePayload } from '@ai-mcq/shared-types';
 
 export interface AIProvider {
   readonly providerName: string;
@@ -22,6 +22,7 @@ export interface AIProvider {
     topicKnowledge?: any[],
     customKnowledgeText?: string,
     webSearchEvidence?: string[],
+    images?: QuestionImagePayload[],
   ): Promise<AIAnswerResult>;
 
   getAvailableModels(): string[];

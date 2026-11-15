@@ -6,6 +6,7 @@ import { SessionsModule } from './sessions/sessions.module';
 import { QuestionsModule } from './questions/questions.module';
 import { EventsModule } from './events/events.module';
 import { HealthController } from './health.controller';
+import { DebugController } from './debug.controller';
 
 @Module({
   imports: [
@@ -16,7 +17,7 @@ import { HealthController } from './health.controller';
     QuestionsModule,
     EventsModule,
   ],
-  controllers: [HealthController],
+  controllers: [HealthController, DebugController],
 })
 export class AppModule {}
 

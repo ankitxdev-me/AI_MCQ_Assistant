@@ -139,7 +139,7 @@ curl http://127.0.0.1:3000/api/health
 1. Click the extension icon in your Chrome toolbar or open the Chrome Side Panel.
 2. If this is your first launch, the extension automatically displays **Screen A: Initial Setup**.
 3. Enter your [Google Gemini API Key](https://aistudio.google.com/app/apikey).
-4. Select your preferred Gemini model (e.g., `gemini-1.5-flash` or `gemini-1.5-pro`).
+4. Select your Gemini model. `gemini-3.5-flash-lite` is the default (fast and cheap). `gemini-3.6-flash` / `gemini-3.8-flash` are stronger. The 1.5 and 2.0 models are shut down.
 5. Click **Test Connection** to verify API validity and latency.
 6. Click **Save Settings**.
 7. The configuration is securely stored in your local SQLite database (`apps/backend/data/mcq_assistant.db`) and will load automatically on future launches.
@@ -173,6 +173,29 @@ It contains 10 test MCQs testing every supported scenario:
 9. Click **Stop Session** and **Summary** to view the full session history, duration, and question breakdown.
 
 ---
+
+## 7b. What the Auto-Loop handles
+
+- Single-answer, multi-answer (checkbox) and True/False questions (radios or plain buttons).
+- Code shown in a split-pane editor (CodeMirror, Monaco, Ace) or `<pre>`, sent to the AI as a `[CODE]` block.
+- "Match the columns" tables, sent as a Markdown table.
+- Image questions: images, SVG diagrams and canvases are sent to Gemini as pictures. If an image cannot be read, a cropped screenshot of the question is used (only works while the tab is the visible tab in its window).
+- Sequence / drag-and-drop questions: the items are dragged into the AI's order through the page's own drag library, the final order is checked, then submitted. Dragging needs the tab to be visible; in a background tab the loop waits and tells you.
+- Several tabs at once: each tab runs its own loop. Waits run on the extension's service worker so background tabs are not slowed down by Chrome. Gemini calls are queued (`GEMINI_MAX_CONCURRENCY`, default 2) and rate-limit errors back off instead of stopping the loop.
+- The loop pauses (instead of guessing) when the AI is unsure, when its answer matches no option, or when a click does not register.
+
+### Knowledge base
+
+Notes added in the side panel are sent with every question. Cached answers remember which notes were active, so adding or deleting a note makes questions get re-asked instead of serving stale answers.
+
+## 7c. End-to-end checks
+
+```bash
+# Backend must be running. Uses the Gemini key saved in the extension.
+node e2e/kb-eval.mjs
+```
+
+`test-portal-advanced.html` is a React practice portal (code pane, match table, image-only, True/False, multi-answer, react-beautiful-dnd sequence). Serve the repo root over HTTP, open the page, then in the console: `await import('/e2e/harness.js'); await __e2e.load(); await __e2e.start();` (needs `npx esbuild apps/extension/src/background/media.ts --bundle --format=iife --global-name=BgMedia --outfile=e2e/.build/bgmedia.js` once).
 
 ## 8. Automated Test Suite
 
