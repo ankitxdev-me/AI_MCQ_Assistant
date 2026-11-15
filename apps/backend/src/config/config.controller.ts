@@ -42,6 +42,12 @@ export class ConfigController {
     return this.configService.saveGeminiConfig(body.apiKey, body.model);
   }
 
+  @Post('model')
+  @HttpCode(HttpStatus.OK)
+  async updateModel(@Body() body: { model: string }) {
+    return this.configService.updateModel(body.model);
+  }
+
   @Post('test')
   @HttpCode(HttpStatus.OK)
   async testConnection(

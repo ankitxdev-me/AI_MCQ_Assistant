@@ -75,7 +75,6 @@ export class GeminiProvider implements AIProvider {
     return this.waiting.length;
   }
   private readonly availableModels = [
-    'gemini-3.5-flash-lite',
     'gemini-flash-lite-latest',
     'gemini-3.1-flash-lite',
     'gemini-3.6-flash',
@@ -90,10 +89,9 @@ export class GeminiProvider implements AIProvider {
    */
   static readonly FALLBACK_MODELS = [
     'gemini-3.5-flash-lite',
-    'gemini-3.1-flash-lite',
-    'gemini-3.6-flash',
-    'gemini-3.8-flash',
-    'gemma-4-26b-a4b-it',
+    'gemini-2.5-flash',
+    'gemini-flash-latest',
+
   ];
 
   /** Model -> time (ms) until which it is rate limited. Skipped until then, no waiting. */
@@ -121,11 +119,13 @@ export class GeminiProvider implements AIProvider {
       return {
         success: false,
         message: 'No Gemini API key provided or found in configuration/environment.',
-        model: testConfig?.model || GeminiProvider.DEFAULT_MODEL,
+
+        model: testConfig?.model || 'gemini-flash-lite-latest',
       };
     }
 
-    const modelName = testConfig?.model || GeminiProvider.DEFAULT_MODEL;
+    const modelName = testConfig?.model || 'gemini-flash-lite-latest';
+
 
     try {
       const genAI = new GoogleGenerativeAI(apiKey);

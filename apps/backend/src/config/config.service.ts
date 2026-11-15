@@ -39,7 +39,9 @@ export class ConfigService {
 
     const isConfigured = hasDbKey || hasEnvFallback;
     const selectedModel =
-      dbModelRow?.value || process.env.GEMINI_DEFAULT_MODEL || GeminiProvider.DEFAULT_MODEL;
+
+      dbModelRow?.value || process.env.GEMINI_DEFAULT_MODEL || 'gemini-flash-lite-latest';
+
 
     return {
       configured: isConfigured,
@@ -87,6 +89,16 @@ export class ConfigService {
     );
 
     this.logger.log('Gemini API configuration securely saved in local database');
+    return this.getConfigStatus();
+  }
+
+  async updateModel(model: string) {
+    const now = new Date().toISOString();
+    this.db.run(
+      `INSERT OR REPLACE INTO configs (key, value, updated_at) VALUES ('gemini_model', ?, ?)`,
+      [model.trim(), now],
+    );
+    this.logger.log(`Active model updated to ${model.trim()}`);
     return this.getConfigStatus();
   }
 
