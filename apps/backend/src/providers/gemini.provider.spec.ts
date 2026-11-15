@@ -9,8 +9,8 @@ describe('GeminiProvider', () => {
 
   it('should list available models', () => {
     const models = provider.getAvailableModels();
-    expect(models).toContain('gemini-1.5-flash');
-    expect(models).toContain('gemini-1.5-pro');
+    expect(models).toContain(GeminiProvider.DEFAULT_MODEL);
+    expect(models.some((m) => m.startsWith('gemini-1.5') || m.startsWith('gemini-2.0'))).toBe(false);
   });
 
   it('should return failure when validating connection without API key', async () => {

@@ -1,19 +1,56 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { AIProvider } from './ai-provider.interface';
-import { AIAnswerResult, AIAnswerResultSchema, QuestionType } from '@ai-mcq/shared-types';
+import { AIAnswerResult, AIAnswerResultSchema, QuestionType, QuestionImagePayload } from '@ai-mcq/shared-types';
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Seconds Gemini asks us to wait on a 429, if it says. */
+export function parseRetryDelayMs(message: string): number | null {
+  const m = message.match(/retry(?:Delay)?["':\s]*(?:in\s*)?"?(\d+(?:\.\d+)?)\s*s/i);
+  return m ? Math.ceil(parseFloat(m[1]) * 1000) : null;
+}
 
 @Injectable()
 export class GeminiProvider implements AIProvider {
   readonly providerName = 'gemini';
   private readonly logger = new Logger(GeminiProvider.name);
 
+  // Kept to models Google lists as available. 1.5 / 2.0 are shut down, 2.5 is limited to
+  // existing users. Update this list when Google retires a model.
+  static readonly DEFAULT_MODEL = 'gemini-3.5-flash-lite';
+
+  /**
+   * Gemini calls are queued. Several tabs running Auto-Loop at once used to fire requests in
+   * parallel, hit the per-minute quota together and all fail, which stopped every loop.
+   */
+  private readonly maxConcurrent = Math.max(1, parseInt(process.env.GEMINI_MAX_CONCURRENCY || '2', 10));
+  private active = 0;
+  private waiting: (() => void)[] = [];
+
+  private async acquireSlot(): Promise<void> {
+    if (this.active < this.maxConcurrent) {
+      this.active++;
+      return;
+    }
+    await new Promise<void>((resolve) => this.waiting.push(resolve)); // slot is handed over on release
+  }
+
+  private releaseSlot(): void {
+    const next = this.waiting.shift();
+    if (next) next();
+    else this.active--;
+  }
+
+  /** Requests currently waiting for a Gemini slot (for logs / health). */
+  get queueLength(): number {
+    return this.waiting.length;
+  }
   private readonly availableModels = [
-    'gemini-3.1-flash-lite',
     'gemini-3.5-flash-lite',
-    'gemini-2.5-flash',
-    'gemini-1.5-flash',
-    'gemini-1.5-pro',
+    'gemini-3.1-flash-lite',
+    'gemini-3.6-flash',
+    'gemini-3.8-flash',
   ];
 
   getAvailableModels(): string[] {
@@ -30,11 +67,11 @@ export class GeminiProvider implements AIProvider {
       return {
         success: false,
         message: 'No Gemini API key provided or found in configuration/environment.',
-        model: testConfig?.model || 'gemini-3.1-flash-lite',
+        model: testConfig?.model || GeminiProvider.DEFAULT_MODEL,
       };
     }
 
-    const modelName = testConfig?.model || 'gemini-3.1-flash-lite';
+    const modelName = testConfig?.model || GeminiProvider.DEFAULT_MODEL;
 
     try {
       const genAI = new GoogleGenerativeAI(apiKey);
@@ -93,18 +130,51 @@ export class GeminiProvider implements AIProvider {
     topicKnowledge?: any[],
     customKnowledgeText?: string,
     webSearchEvidence?: string[],
+    images?: QuestionImagePayload[],
   ): Promise<AIAnswerResult> {
     const apiKey = apiKeyOverride || process.env.GEMINI_API_KEY;
     if (!apiKey) {
       throw new Error('Gemini API key is not configured.');
     }
 
+    await this.acquireSlot();
+    try {
+      return await this.generateAnswerUnqueued(
+        apiKey,
+        question,
+        options,
+        optionsMetadata,
+        modelOverride,
+        topicKnowledge,
+        customKnowledgeText,
+        webSearchEvidence,
+        images,
+      );
+    } finally {
+      this.releaseSlot();
+    }
+  }
+
+  private async generateAnswerUnqueued(
+    apiKey: string,
+    question: string,
+    options: { id: string; text: string }[],
+    optionsMetadata:
+      | { isMultipleChoiceMultipleAnswer?: boolean; isOrderingQuestion?: boolean; questionType?: QuestionType }
+      | undefined,
+    modelOverride?: string,
+    topicKnowledge?: any[],
+    customKnowledgeText?: string,
+    webSearchEvidence?: string[],
+    images?: QuestionImagePayload[],
+  ): Promise<AIAnswerResult> {
+
     const genAI = new GoogleGenerativeAI(apiKey);
     const isMultiAnswer = optionsMetadata?.isMultipleChoiceMultipleAnswer ?? false;
     const isOrdering = Boolean(optionsMetadata?.isOrderingQuestion || optionsMetadata?.questionType === 'ORDERING');
 
-    const requestedModel = modelOverride || 'gemini-3.1-flash-lite';
-    const fallbackList = ['gemini-3.1-flash-lite', 'gemini-3.5-flash-lite', 'gemini-2.5-flash'];
+    const requestedModel = modelOverride || GeminiProvider.DEFAULT_MODEL;
+    const fallbackList = [GeminiProvider.DEFAULT_MODEL, 'gemini-3.1-flash-lite', 'gemini-3.6-flash'];
     const modelsToTry = [requestedModel, ...fallbackList.filter((m) => m !== requestedModel)];
 
     let systemPrompt = '';
@@ -178,6 +248,13 @@ STRICT INSTRUCTIONS:
 }`;
     }
 
+    const imageList = (images || []).slice(0, 8);
+    if (imageList.length > 0) {
+      systemPrompt += `\n\nATTACHED IMAGES: ${imageList.length} image(s) are attached and are PART OF THE QUESTION (diagrams, code screenshots, tables, graphs, or pictures used as options). Read every image carefully before answering. Image order and meaning:\n${imageList
+        .map((img, i) => `Image ${i + 1}: ${img.label || 'Question figure'}`)
+        .join('\n')}\nIf a screenshot shows the question and options, use the option IDs given in the JSON, matching them to the option texts.`;
+    }
+
     if (webSearchEvidence && webSearchEvidence.length > 0) {
       const searchSnippets = webSearchEvidence.slice(0, 5).join('\n\n');
       systemPrompt += `\n\nLIVE WEB & BROWSER SEARCH EVIDENCE (Retrieved via Web Search Tool):\n${searchSnippets}\n\nHIGH PRIORITY SEARCH MATCHING RULE:\n1. If the web search evidence above contains the exact question or identical problem setup, MATCH it to the provided options and SELECT the verified answer directly!\n2. If the web search evidence does not directly answer this question, proceed to use the user notes and logical reasoning rules below.`;
@@ -235,11 +312,17 @@ STRICT INSTRUCTIONS:
     });
 
     let lastError: Error | null = null;
+    const timeoutMs = imageList.length > 0 ? 60000 : 40000;
+    const parts: any[] = [
+      { text: userContent },
+      ...imageList.map((img) => ({ inlineData: { mimeType: img.mimeType, data: img.data } })),
+    ];
 
     for (const currentModelName of modelsToTry) {
       let attempts = 0;
       const maxAttempts = 2;
       let delay = 800;
+      let waitedForQuota = false;
 
       while (attempts < maxAttempts) {
         attempts++;
@@ -247,21 +330,24 @@ STRICT INSTRUCTIONS:
           const model = genAI.getGenerativeModel({
             model: currentModelName,
             generationConfig: {
-              temperature: 0.1,
               responseMimeType: 'application/json',
             },
             systemInstruction: systemPrompt,
           });
 
           const generatePromise = model.generateContent({
-            contents: [{ role: 'user', parts: [{ text: userContent }] }],
+            contents: [{ role: 'user', parts }],
           });
 
-          const timeoutPromise = new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error('AI request timed out after 15 seconds')), 15000),
-          );
+          let timer: NodeJS.Timeout | undefined;
+          const timeoutPromise = new Promise<never>((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error(`AI request timed out after ${timeoutMs / 1000} seconds`)),
+              timeoutMs,
+            );
+          });
 
-          const response = await Promise.race([generatePromise, timeoutPromise]);
+          const response = await Promise.race([generatePromise, timeoutPromise]).finally(() => clearTimeout(timer));
           const responseText = response.response.text();
 
           const cleanedJson = this.cleanJsonResponse(responseText);
@@ -297,7 +383,15 @@ STRICT INSTRUCTIONS:
             ),
             selected_option_ids: selectedIds,
             ordered_sequence: orderedSeq,
-            answer_text: String(parsed.answer_text || (orderedSeq ? orderedSeq.join(' → ') : '')),
+            answer_text: String(
+              parsed.answer_text ||
+                (orderedSeq
+                  ? orderedSeq.join(' → ')
+                  : (selectedIds || [String(parsed.selected_option_id || '')])
+                      .map((id) => options.find((o) => o.id === id)?.text || id)
+                      .join(' | ')) ||
+                'No answer text',
+            ),
             explanation: String(parsed.explanation || 'No explanation provided.'),
             confidence: typeof parsed.confidence === 'number' ? parsed.confidence : 0.9,
             needs_review: Boolean(parsed.needs_review),
@@ -355,21 +449,34 @@ STRICT INSTRUCTIONS:
           if (webSearchEvidence && webSearchEvidence.length > 0) {
             validated.webEvidence = webSearchEvidence;
           }
+          if (imageList.length > 0) {
+            validated.imagesUsed = imageList.length;
+          }
 
           this.logger.log(`Successfully solved question using model: ${currentModelName}`);
           return validated;
         } catch (err: any) {
           lastError = err;
-          const isQuota =
-            err.message?.includes('429') ||
-            err.message?.includes('quota') ||
-            err.message?.includes('ResourceExhausted') ||
-            err.message?.includes('not found') ||
-            err.message?.includes('no longer available');
+          const msg: string = err.message || '';
+          const isRateLimited = /429|quota|resource.?exhausted|rate.?limit/i.test(msg);
+          const isUnavailable = /not found|no longer available|404|deprecated/i.test(msg);
 
-          this.logger.warn(`Model ${currentModelName} attempt ${attempts} error: ${err.message}`);
+          this.logger.warn(`Model ${currentModelName} attempt ${attempts} error: ${msg}`);
 
-          if (isQuota) {
+          // Per-minute limit: if Gemini says to wait a short while, wait once on this model
+          // instead of burning through every fallback model in a second.
+          if (isRateLimited && !waitedForQuota) {
+            const retryMs = parseRetryDelayMs(msg);
+            if (retryMs !== null && retryMs <= 30000) {
+              waitedForQuota = true;
+              this.logger.warn(`Rate limited on ${currentModelName}. Waiting ${Math.round(retryMs / 1000)}s as Gemini asked.`);
+              await sleep(retryMs + 500);
+              attempts--; // the wait is not a failed attempt
+              continue;
+            }
+          }
+
+          if (isRateLimited || isUnavailable) {
             this.logger.warn(
               `Quota/availability issue on ${currentModelName}. Switching to fallback model...`,
             );

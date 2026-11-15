@@ -27,7 +27,6 @@ export class HealthController {
       path.resolve(process.cwd(), 'test-portal.html'),
       path.resolve(process.cwd(), '../../test-portal.html'),
       path.resolve(__dirname, '../../../test-portal.html'),
-      'c:\\Users\\ankit\\OneDrive\\Documents\\Chrome Extension\\test-portal.html',
     ];
     for (const p of candidatePaths) {
       if (fs.existsSync(p)) {

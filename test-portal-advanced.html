@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Advanced MCQ Practice (E2E)</title>
+  <!--
+    End-to-end test portal modelled on a React practice site: one question at a time,
+    SUBMIT unlocks only after React state registers a choice, then NEXT appears.
+    Covers: code in a split-pane editor, match-the-columns table, image-only question,
+    True/False radios without "?", True/False buttons, two code questions with identical
+    wording + options, multi-answer checkboxes, and a react-beautiful-dnd sequence question.
+  -->
+  <script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/react-beautiful-dnd@13.1.1/dist/react-beautiful-dnd.min.js"></script>
+  <style>
+    :root { --blue: #2563eb; --line: #e2e8f0; --ink: #1e293b; --muted: #64748b; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, sans-serif; color: var(--ink); background: #f8fafc; }
+    .topbar { display: flex; justify-content: space-between; align-items: center; padding: 10px 20px; background: #fff; border-bottom: 1px solid var(--line); }
+    .topbar img { width: 32px; height: 32px; border-radius: 50%; }
+    .sub { display: flex; justify-content: space-between; padding: 6px 20px; font-size: 12px; font-weight: 600; border-bottom: 2px solid var(--blue); background: #fff; }
+    .sub a { color: var(--blue); text-decoration: none; }
+    .stage { padding: 20px; }
+    .card { background: #fff; border-radius: 10px; padding: 24px; max-width: 760px; margin: 0 auto; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+    .split { display: grid; grid-template-columns: 320px 1fr; gap: 0; min-height: 420px; }
+    .split .left { background: #fff; padding: 24px; border-radius: 10px 0 0 10px; }
+    .cm-editor { background: #0f172a; color: #e2e8f0; font-family: ui-monospace, monospace; font-size: 13px; border-radius: 0 10px 10px 0; padding: 12px 0; }
+    .cm-scroller { display: flex; }
+    .cm-gutters { color: #64748b; padding: 0 10px; text-align: right; }
+    .cm-content { padding: 0 10px; white-space: pre; }
+    .cm-line { min-height: 1.4em; }
+    .prompt { margin: 0 0 14px; line-height: 1.5; }
+    .opt { display: flex; align-items: center; gap: 10px; margin: 8px 0; cursor: pointer; }
+    .tf { padding: 8px 22px; margin-right: 10px; border: 1px solid var(--line); border-radius: 6px; background: #fff; cursor: pointer; }
+    .tf.selected { border-color: var(--blue); background: #eff6ff; }
+    table { border-collapse: collapse; font-size: 12px; margin-bottom: 16px; }
+    th { background: var(--blue); color: #fff; padding: 8px 12px; }
+    td { border: 1px solid var(--line); padding: 6px 12px; }
+    .dnd-item { display: flex; gap: 10px; align-items: center; padding: 10px 14px; margin: 8px 0; background: #fff; border: 1px solid var(--line); border-radius: 8px; }
+    .handle { cursor: grab; color: #94a3b8; }
+    .actions { margin-top: 18px; display: flex; gap: 12px; align-items: center; }
+    .btn { background: var(--blue); color: #fff; border: 0; padding: 10px 26px; border-radius: 6px; font-weight: 600; cursor: pointer; }
+    .btn:disabled { background: #cbd5e1; cursor: not-allowed; }
+    .ghost { background: #fff; color: var(--blue); border: 1px solid var(--blue); }
+    .verdict { font-weight: 600; }
+    .done { text-align: center; padding: 40px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script>
+    // Build the image for the image-only question at runtime (no external file needed)
+    function makeQuestionImage() {
+      const c = document.createElement('canvas');
+      c.width = 420; c.height = 140;
+      const g = c.getContext('2d');
+      g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height);
+      g.strokeStyle = '#1e293b'; g.lineWidth = 3; g.strokeRect(6, 6, c.width - 12, c.height - 12);
+      g.fillStyle = '#0f172a'; g.font = 'bold 52px sans-serif';
+      g.fillText('17 × 3 = ?', 70, 92);
+      return c.toDataURL('image/png');
+    }
+    const AVATAR = 'data:image/svg+xml;utf8,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><circle cx="16" cy="16" r="16" fill="#94a3b8"/></svg>');
+
+    const QUESTIONS = [
+      { id: 'code-port', type: 'radio', layout: 'split',
+        prompt: 'Considering the given code snippet, at which of the following ports a server would listen for connections?',
+        code: ['const express = require("express");', 'const app = express();', '', 'app.get("/", (request, response) => {', '  response.send("Data Received");', '});', '', 'app.listen(3001);'],
+        options: ['3000', '30', '3001', '300'], answer: '3001' },
+      { id: 'match-table', type: 'radio',
+        prompt: 'Match Column 1 with Column 2.',
+        table: [['Column 1 (Request Methods)', 'Column 2 (Operation)'], ['1) GET', 'A) Delete'], ['2) POST', 'B) Read'], ['3) PUT', 'C) Create'], ['4) DELETE', 'D) Update']],
+        options: ['1 - B, 2 - D, 3 - C, 4 - A', '1 - B, 2 - C, 3 - D, 4 - A', '1 - D, 2 - C, 3 - B, 4 - A', '1 - D, 2 - B, 3 - C, 4 - A'],
+        answer: '1 - B, 2 - C, 3 - D, 4 - A' },
+      { id: 'image-only', type: 'radio', image: true, prompt: '',
+        options: ['41', '51', '54', '61'], answer: '51' },
+      { id: 'tf-radio', type: 'radio',
+        prompt: 'HTTP is a stateless protocol.',
+        options: ['True', 'False'], answer: 'True' },
+      { id: 'tf-buttons', type: 'tf-buttons',
+        prompt: 'In JavaScript, a variable declared with const can be reassigned to a new value.',
+        options: ['True', 'False'], answer: 'False' },
+      { id: 'output-1', type: 'radio', layout: 'split',
+        prompt: 'What will be the output of the following code?',
+        code: ['console.log(2 ** 3);'], options: ['5', '8', '23', '6'], answer: '8' },
+      { id: 'output-2', type: 'radio', layout: 'split',
+        prompt: 'What will be the output of the following code?',
+        code: ['console.log("2" + 3);'], options: ['5', '8', '23', '6'], answer: '23' },
+      { id: 'multi', type: 'checkbox',
+        prompt: 'Which of the following are valid HTTP request methods? (Select all that apply)',
+        options: ['GET', 'FETCH', 'POST', 'SEND'], answer: ['GET', 'POST'] },
+      { id: 'sequence', type: 'order',
+        prompt: 'Set the following steps in sequence to create and start an Express server.',
+        options: ['Call app.listen() with a port number', 'Install the express package using npm', 'Create an app instance by calling express()', 'Import express using require()'],
+        answer: ['Install the express package using npm', 'Import express using require()', 'Create an app instance by calling express()', 'Call app.listen() with a port number'] },
+    ];
+
+    window.__results = {};
+    const h = React.createElement;
+    const { DragDropContext, Droppable, Draggable } = window.ReactBeautifulDnd;
+    const IMAGE_URL = makeQuestionImage();
+
+    function Question({ q, onSubmit }) {
+      const [sel, setSel] = React.useState(q.type === 'checkbox' ? [] : null);
+      const [order, setOrder] = React.useState(q.options);
+      const [verdict, setVerdict] = React.useState(null);
+
+      const ready = q.type === 'order' ? true : q.type === 'checkbox' ? sel.length > 0 : sel !== null;
+      const submit = () => {
+        const given = q.type === 'order' ? order : sel;
+        const ok = JSON.stringify(given) === JSON.stringify(q.answer) ||
+          (q.type === 'checkbox' && [...given].sort().join('|') === [...q.answer].sort().join('|'));
+        window.__results[q.id] = { given, ok };
+        setVerdict(ok);
+      };
+
+      let body;
+      if (q.type === 'radio') {
+        body = q.options.map((o) => h('label', { className: 'opt', key: o },
+          h('input', { type: 'radio', name: 'q-' + q.id, checked: sel === o, onChange: () => setSel(o), disabled: verdict !== null }), ' ', o));
+      } else if (q.type === 'checkbox') {
+        body = q.options.map((o) => h('label', { className: 'opt', key: o },
+          h('input', { type: 'checkbox', checked: sel.includes(o), disabled: verdict !== null,
+            onChange: () => setSel((s) => (s.includes(o) ? s.filter((x) => x !== o) : [...s, o])) }), ' ', o));
+      } else if (q.type === 'tf-buttons') {
+        body = h('div', null, q.options.map((o) => h('button', {
+          key: o, type: 'button', className: 'tf' + (sel === o ? ' selected' : ''), onClick: () => verdict === null && setSel(o) }, o)));
+      } else {
+        body = h(DragDropContext, { onDragEnd: (r) => {
+            if (!r.destination) return;
+            const next = [...order];
+            const [m] = next.splice(r.source.index, 1);
+            next.splice(r.destination.index, 0, m);
+            setOrder(next);
+          } },
+          h(Droppable, { droppableId: 'steps' }, (p) => h('div', { ref: p.innerRef, ...p.droppableProps },
+            order.map((o, i) => h(Draggable, { draggableId: 'item-' + q.options.indexOf(o), index: i, key: o, isDragDisabled: verdict !== null },
+              (dp) => h('div', { ref: dp.innerRef, ...dp.draggableProps, className: 'dnd-item' },
+                h('span', { className: 'handle', ...dp.dragHandleProps }, '⋮⋮'), h('span', null, o)))),
+            p.placeholder)),
+        );
+      }
+
+      const actions = h('div', { className: 'actions' },
+        verdict === null
+          ? [h('button', { key: 's', className: 'btn', disabled: !ready, onClick: submit }, 'SUBMIT'),
+             h('button', { key: 'k', className: 'btn ghost', onClick: () => onSubmit(true) }, 'SKIP')]
+          : [h('span', { key: 'v', className: 'verdict' }, verdict ? 'Correct!' : 'Wrong answer'),
+             h('button', { key: 'n', className: 'btn', onClick: () => onSubmit(false) }, 'NEXT')]);
+
+      const promptEl = q.prompt ? h('p', { className: 'prompt' }, q.prompt) : null;
+      const tableEl = q.table ? h('table', null, h('tbody', null, q.table.map((row, r) =>
+        h('tr', { key: r }, row.map((c, i) => h(r === 0 ? 'th' : 'td', { key: i }, c)))))) : null;
+      const imageEl = q.image ? h('img', { src: IMAGE_URL, alt: '', width: 420, height: 140, style: { display: 'block', marginBottom: 16 } }) : null;
+
+      if (q.layout === 'split') {
+        return h('div', { className: 'split' },
+          h('div', { className: 'left' }, promptEl, body, actions),
+          h('div', { className: 'cm-editor' }, h('div', { className: 'cm-scroller' },
+            h('div', { className: 'cm-gutters' }, q.code.map((_, i) => h('div', { key: i }, i + 1))),
+            h('div', { className: 'cm-content', contentEditable: true, suppressContentEditableWarning: true },
+              q.code.map((line, i) => h('div', { className: 'cm-line', key: i }, line || '​'))))));
+      }
+      return h('div', { className: 'card' }, promptEl, tableEl, imageEl, body, actions);
+    }
+
+    function App() {
+      const [idx, setIdx] = React.useState(0);
+      const [attempted, setAttempted] = React.useState(0);
+      const q = QUESTIONS[idx];
+      return h(React.Fragment, null,
+        h('div', { className: 'topbar' }, h('strong', null, 'Practice University'), h('img', { src: AVATAR, alt: 'profile' })),
+        h('div', { className: 'sub' }, h('span', null, '← MCQ PRACTICE'),
+          h('span', null, 'QUESTIONS ATTEMPTED: ' + attempted + '/' + QUESTIONS.length),
+          h('a', { href: 'https://example.com/end' }, 'END PRACTICE')),
+        h('div', { className: 'stage' }, q
+          ? h(Question, { key: q.id, q, onSubmit: (skipped) => { if (!skipped) setAttempted((a) => a + 1); setIdx((i) => i + 1); } })
+          : h('div', { className: 'card done', id: 'practice-done' }, 'Practice complete')));
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(h(App));
+  </script>
+</body>
+</html>

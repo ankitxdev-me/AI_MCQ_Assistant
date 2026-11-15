@@ -12,3 +12,6 @@ apps/backend/data/*.db
 !.env.example
 coverage/
 
+
+# E2E build output
+e2e/.build/

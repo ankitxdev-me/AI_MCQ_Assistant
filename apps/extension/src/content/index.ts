@@ -1,327 +1,595 @@
-import { DOMQuestionExtractor } from './extractor';
+import { DOMQuestionExtractor, VISUAL_PLACEHOLDER_PROMPT } from './extractor';
 import { DOMInteractionManager } from './interaction';
 import { DOMQuestionObserver } from './observer';
 import { matchAIAnswerToOptions, matchAIMultipleAnswersToOptions } from './matcher';
-import { ExtensionMessage } from '@ai-mcq/shared-types';
+import { buildMediaRequest, regionScreenshotRect, ResolvedMedia } from './media';
+import { sleep } from './timing';
+import { ExtensionMessage, ExtractedQuestion } from '@ai-mcq/shared-types';
 
-const extractor = new DOMQuestionExtractor();
-const interaction = new DOMInteractionManager();
-
-// Observer sends updates to the background script
-const observer = new DOMQuestionObserver(extractor, (questions, currentQuestion) => {
-  if (document.hidden) return; // Multi-tab isolation: never send messages from hidden background tabs
-  try {
-    chrome.runtime.sendMessage({
-      type: 'DOM_QUESTIONS_EXTRACTED',
-      payload: {
-        questions,
-        currentQuestion,
-        url: window.location.href,
-        title: document.title,
-      },
-    });
-  } catch (err) {
-    // Context may be invalidated if extension was reloaded
-  }
-});
-
-// Auto-start observer on idle
-observer.start();
-
-// Listen to incoming messages from extension popup/sidepanel/background
-chrome.runtime.onMessage.addListener((message: ExtensionMessage, sender, sendResponse) => {
-  switch (message.type) {
-    case 'DOM_EXTRACT_QUESTIONS': {
-      const questions = extractor.extractAllQuestions();
-      const currentQuestion = questions.length > 0 ? questions[0] : undefined;
-      sendResponse({
-        success: true,
-        questions,
-        currentQuestion,
-        url: window.location.href,
-        title: document.title,
-      });
-      break;
-    }
-
-    case 'CONFIRM_SELECTION': {
-      const payload = message.payload as any;
-      if (Array.isArray(payload.optionIds) && payload.optionIds.length > 0) {
-        const result = interaction.selectMultipleOptions(payload.optionIds, payload.options || []);
-        sendResponse(result);
-      } else {
-        const result = interaction.selectOption(
-          payload.optionId,
-          payload.elementSelector,
-          payload.optionText,
-        );
-        sendResponse(result);
+/**
+ * The side panel injects this file again when it gets no answer from the tab. Two live copies
+ * in one tab meant two Auto-Loops answering the same question. Only one live copy may run;
+ * a copy orphaned by an extension reload (its runtime id is gone) is replaced.
+ */
+const GUARD_KEY = '__aiMcqAssistantContent';
+const existing = (window as any)[GUARD_KEY] as { alive: () => boolean } | undefined;
+const ownChrome = chrome;
+if (!existing || !existing.alive()) {
+  (window as any)[GUARD_KEY] = {
+    alive: () => {
+      try {
+        return !!ownChrome.runtime?.id;
+      } catch {
+        return false;
       }
-      break;
+    },
+  };
+  initContentScript();
+}
+
+function initContentScript(): void {
+  const extractor = new DOMQuestionExtractor();
+  const interaction = new DOMInteractionManager();
+
+  // Observer sends updates to the side panel
+  const observer = new DOMQuestionObserver(extractor, (questions, currentQuestion) => {
+    if (document.hidden) return; // Multi-tab isolation: never send messages from hidden background tabs
+    try {
+      chrome.runtime.sendMessage(
+        {
+          type: 'DOM_QUESTIONS_EXTRACTED',
+          payload: { questions, currentQuestion, url: window.location.href, title: document.title },
+        },
+        () => void chrome.runtime.lastError,
+      );
+    } catch (err) {
+      // Context may be invalidated if extension was reloaded
     }
+  });
+  observer.start();
 
-    case 'MATCH_AND_SELECT' as any: {
-      const { aiResult, options, isMultipleAnswer } = (message as any).payload || {};
-      const isMulti =
-        isMultipleAnswer === true ||
-        (Array.isArray(aiResult?.selected_option_ids) && aiResult.selected_option_ids.length > 0) ||
-        (aiResult?.selected_option_id &&
-          (aiResult.selected_option_id.includes(',') ||
-            aiResult.selected_option_id.includes(';') ||
-            /\band\b/i.test(aiResult.selected_option_id)));
+  // -------------------------------------------------------------------------
+  // Messaging helpers
+  // -------------------------------------------------------------------------
 
-      if (isMulti) {
-        const multiMatch = matchAIMultipleAnswersToOptions(aiResult, options);
-        if (multiMatch.isMatched && multiMatch.matchedIds.length > 0) {
-          const result = interaction.selectMultipleOptions(multiMatch.matchedIds, options);
-          sendResponse({ ...result, match: multiMatch, matched: true, success: true });
-          break;
+  function sendToBackground<T = any>(type: string, payload: unknown): Promise<T & { success: boolean; error?: string }> {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage({ type, payload }, (res: any) => {
+          const lastError = chrome.runtime.lastError;
+          if (lastError) {
+            resolve({ success: false, error: lastError.message || 'Extension messaging error' } as any);
+          } else {
+            resolve(res || ({ success: false, error: 'No response from extension background' } as any));
+          }
+        });
+      } catch (err: any) {
+        resolve({ success: false, error: err?.message || 'Extension messaging error' } as any);
+      }
+    });
+  }
+
+  function backendPost(endpoint: string, body: unknown) {
+    return sendToBackground<{ data?: any }>('BACKEND_FETCH', {
+      endpoint,
+      options: { method: 'POST', body: JSON.stringify(body) },
+    });
+  }
+
+  function isPlaceholderQuestion(q: ExtractedQuestion): boolean {
+    const t = q.questionText.trim();
+    return t.includes(VISUAL_PLACEHOLDER_PROMPT) || /^question \d+$/i.test(t);
+  }
+
+  /**
+   * Turns the question's images into bytes for Gemini. Unreadable images (cross-origin canvas,
+   * failed downloads) and image-only questions fall back to a cropped screenshot of the
+   * question, which Chrome only allows while the tab is the visible one in its window.
+   */
+  async function prepareQuestionMedia(q: ExtractedQuestion): Promise<ResolvedMedia> {
+    const refs = q.images || [];
+    const placeholder = isPlaceholderQuestion(q);
+    if (refs.length === 0 && !placeholder) return { images: [], failures: [], screenshotUsed: false };
+
+    const handle = extractor.getQuestionMedia(q.fingerprint);
+    const { items, unreadable } = handle
+      ? await buildMediaRequest(refs, handle.imageElements)
+      : { items: [], unreadable: refs.length };
+
+    const first = items.length
+      ? await sendToBackground<ResolvedMedia>('RESOLVE_MEDIA', { items })
+      : ({ success: true, images: [], failures: [], screenshotUsed: false } as any);
+    const images = first.images || [];
+    const failures: string[] = [...(first.failures || [])];
+    if (unreadable > 0) failures.push(`${unreadable} figure(s) could not be read from the page`);
+
+    const needScreenshot = failures.length > 0 || (placeholder && images.length === 0);
+    if (needScreenshot && handle) {
+      if (document.hidden) {
+        failures.push('Screenshot skipped: tab is not visible');
+      } else {
+        handle.region.scrollIntoView({ block: 'center' });
+        await sleep(400);
+        const rect = regionScreenshotRect(handle.region);
+        if (rect) {
+          const shot = await sendToBackground<ResolvedMedia>('RESOLVE_MEDIA', { screenshotRect: rect });
+          images.push(...(shot.images || []));
+          failures.push(...(shot.failures || []));
+          return { images, failures, screenshotUsed: !!shot.screenshotUsed };
         }
       }
-
-      // Single option match
-      const match = matchAIAnswerToOptions(aiResult, options);
-      if (match.isMatched && match.matchedOption) {
-        const result = interaction.selectOption(
-          match.matchedId!,
-          match.matchedOption.elementSelector,
-          match.matchedText!,
-        );
-        sendResponse({ ...result, match, matched: true, success: true });
-        break;
-      }
-
-      // Safe fallback if neither matched: pick the first option to prevent auto-loop halt
-      if (options && options.length > 0) {
-        const fallbackOpt = options[0];
-        const result = interaction.selectOption(
-          fallbackOpt.id,
-          fallbackOpt.elementSelector,
-          fallbackOpt.text,
-        );
-        sendResponse({
-          ...result,
-          match: {
-            matchedOption: fallbackOpt,
-            matchedId: fallbackOpt.id,
-            matchedText: fallbackOpt.text,
-            confidence: 0.5,
-            matchReason: 'fallback-first-option',
-            isMatched: true,
-          },
-          matched: true,
-          success: true,
-        });
-        break;
-      }
-
-      sendResponse({
-        success: false,
-        matched: false,
-        message: `Could not match Gemini answer to DOM options.`,
-        match,
-      });
-      break;
     }
-
-    case 'REORDER_OPTIONS' as any: {
-      const { targetSequence, options } = (message as any).payload || {};
-      interaction.reorderOptions(targetSequence || [], options || []).then((res) => {
-        sendResponse(res);
-      });
-      return true;
-    }
-
-    case 'SUBMIT_ANSWER' as any: {
-      interaction.clickSubmitButton(6000).then((res) => {
-        sendResponse(res);
-      });
-      return true;
-    }
-
-    case 'INSPECT_SUBMISSION' as any: {
-      const { options, selectedOptionId } = (message as any).payload || {};
-      const result = interaction.inspectSubmissionResult(options || [], selectedOptionId);
-      sendResponse(result);
-      break;
-    }
-
-    case 'WAIT_AND_CLICK_NEXT' as any: {
-      interaction.waitForAndClickNextButton(15000).then((res) => {
-        sendResponse(res);
-      });
-      return true;
-    }
-
-    case 'NAVIGATE_NEXT_QUESTION': {
-      const result = interaction.navigateNextQuestion();
-      sendResponse(result);
-      break;
-    }
-
-    case 'START_TAB_AUTO_LOOP' as any: {
-      tabAutoLoopActive = true;
-      tabSubmittedFingerprints.clear();
-      executeTabAutoLoopCycle();
-      sendResponse({ success: true, isRunning: true });
-      break;
-    }
-
-    case 'STOP_TAB_AUTO_LOOP' as any: {
-      tabAutoLoopActive = false;
-      isCycleRunning = false;
-      tabAutoLoopStatus = 'Auto-Loop paused';
-      sendResponse({ success: true, isRunning: false });
-      break;
-    }
-
-    case 'GET_TAB_AUTO_LOOP_STATUS' as any: {
-      sendResponse({
-        isRunning: tabAutoLoopActive,
-        status: tabAutoLoopStatus,
-        solvedCount: tabSolvedCount,
-      });
-      break;
-    }
-
-    default:
-      break;
+    return { images, failures, screenshotUsed: false };
   }
-  return true; // Keep message channel open for async response
-});
 
-// Per-tab isolated auto-loop state (enables multiple tabs to run simultaneously in parallel)
-let tabAutoLoopActive = false;
-let tabAutoLoopStatus = '';
-let tabSolvedCount = 0;
-let isCycleRunning = false;
-const tabSubmittedFingerprints = new Set<string>();
+  // -------------------------------------------------------------------------
+  // Messages from the side panel
+  // -------------------------------------------------------------------------
 
-async function executeTabAutoLoopCycle(): Promise<void> {
-  if (!tabAutoLoopActive || isCycleRunning) return;
-  isCycleRunning = true;
+  chrome.runtime.onMessage.addListener((message: ExtensionMessage, sender, sendResponse) => {
+    switch (message.type) {
+      case 'DOM_EXTRACT_QUESTIONS': {
+        const questions = extractor.extractAllQuestions();
+        sendResponse({
+          success: true,
+          questions,
+          currentQuestion: questions[0],
+          url: window.location.href,
+          title: document.title,
+        });
+        return false;
+      }
 
-  try {
-    const questions = extractor.extractAllQuestions();
-    if (questions.length === 0) {
-      tabAutoLoopStatus = 'Scanning webpage for questions...';
-      isCycleRunning = false;
-      if (tabAutoLoopActive) setTimeout(executeTabAutoLoopCycle, 1200);
-      return;
+      case 'PREPARE_QUESTION_MEDIA' as any: {
+        const { fingerprint } = (message as any).payload || {};
+        const questions = extractor.extractAllQuestions(); // refresh live element handles
+        const q = questions.find((x) => x.fingerprint === fingerprint);
+        if (!q) {
+          sendResponse({ images: [], failures: ['Question is no longer on the page'], screenshotUsed: false });
+          return false;
+        }
+        prepareQuestionMedia(q).then(sendResponse);
+        return true;
+      }
+
+      case 'CONFIRM_SELECTION': {
+        const payload = message.payload as any;
+        if (Array.isArray(payload.optionIds) && payload.optionIds.length > 0) {
+          sendResponse(interaction.selectMultipleOptions(payload.optionIds, payload.options || []));
+        } else {
+          sendResponse(interaction.selectOption(payload.optionId, payload.elementSelector, payload.optionText));
+        }
+        return false;
+      }
+
+      case 'MATCH_AND_SELECT' as any: {
+        const { aiResult, options, isMultipleAnswer } = (message as any).payload || {};
+        const isMulti =
+          isMultipleAnswer === true ||
+          (Array.isArray(aiResult?.selected_option_ids) && aiResult.selected_option_ids.length > 0) ||
+          (aiResult?.selected_option_id &&
+            (aiResult.selected_option_id.includes(',') ||
+              aiResult.selected_option_id.includes(';') ||
+              /\band\b/i.test(aiResult.selected_option_id)));
+
+        if (isMulti) {
+          const multiMatch = matchAIMultipleAnswersToOptions(aiResult, options);
+          if (multiMatch.isMatched && multiMatch.matchedIds.length > 0) {
+            const result = interaction.selectMultipleOptions(multiMatch.matchedIds, options);
+            sendResponse({ ...result, match: multiMatch, matched: true });
+            return false;
+          }
+        }
+
+        const match = matchAIAnswerToOptions(aiResult, options);
+        if (match.isMatched && match.matchedOption) {
+          const result = interaction.selectOption(match.matchedId!, match.matchedOption.elementSelector, match.matchedText!);
+          sendResponse({ ...result, match, matched: true });
+          return false;
+        }
+
+        // No match: report it. Never guess an option on the user's behalf.
+        sendResponse({ success: false, matched: false, message: 'Could not match Gemini answer to DOM options.', match });
+        return false;
+      }
+
+      case 'REORDER_OPTIONS' as any: {
+        const { targetSequence, options } = (message as any).payload || {};
+        interaction.reorderOptions(targetSequence || [], options || []).then(sendResponse);
+        return true;
+      }
+
+      case 'SUBMIT_ANSWER' as any: {
+        interaction.clickSubmitButton(6000).then(sendResponse);
+        return true;
+      }
+
+      case 'INSPECT_SUBMISSION' as any: {
+        const { options, selectedOptionId } = (message as any).payload || {};
+        sendResponse(interaction.inspectSubmissionResult(options || [], selectedOptionId));
+        return false;
+      }
+
+      case 'WAIT_AND_CLICK_NEXT' as any: {
+        interaction.waitForAndClickNextButton(15000).then(sendResponse);
+        return true;
+      }
+
+      case 'NAVIGATE_NEXT_QUESTION': {
+        sendResponse(interaction.navigateNextQuestion());
+        return false;
+      }
+
+      case 'START_TAB_AUTO_LOOP' as any: {
+        startAutoLoop();
+        sendResponse({ success: true, isRunning: true });
+        return false;
+      }
+
+      case 'STOP_TAB_AUTO_LOOP' as any: {
+        stopAutoLoop('Auto-Loop paused');
+        sendResponse({ success: true, isRunning: false });
+        return false;
+      }
+
+      case 'GET_TAB_AUTO_LOOP_STATUS' as any: {
+        sendResponse({ isRunning: loopActive, status: loopStatus, solvedCount });
+        return false;
+      }
+
+      default:
+        return false;
     }
+  });
 
-    const liveQuestion = questions[0];
-    if (tabSubmittedFingerprints.has(liveQuestion.fingerprint)) {
-      tabAutoLoopStatus = 'Waiting for next question to render...';
-      isCycleRunning = false;
-      if (tabAutoLoopActive) setTimeout(executeTabAutoLoopCycle, 1000);
-      return;
-    }
+  // -------------------------------------------------------------------------
+  // Per-tab Auto-Loop. Every tab runs its own copy with its own state and session.
+  // -------------------------------------------------------------------------
 
-    tabAutoLoopStatus = `1. Solving with Gemini: "${liveQuestion.questionText.slice(0, 45)}..."`;
+  let loopActive = false;
+  let loopStatus = '';
+  let solvedCount = 0;
+  // Each start/stop bumps runId. A cycle from an older run sees the mismatch and exits,
+  // so a quick stop + start can never leave two cycles answering in parallel.
+  let runId = 0;
+  let cycleRunningFor = -1;
+  let sessionId: string | undefined;
+  let failures = 0;
+  let busyRetries = 0;
+  let idleSince = 0;
+  let lowConfidence = 0;
+  const submitted = new Set<string>();
+  // Answers already fetched in this run: re-checking a question never re-asks the backend
+  const answers = new Map<string, any>();
+  // How many times each question was picked up without being submitted (loop detector)
+  const attempts = new Map<string, number>();
 
-    // Solve question via background proxy fetch
-    const response: any = await new Promise((resolve) => {
+  const MAX_FAILURES = 4;
+  const MAX_BUSY_RETRIES = 8;
+  const MAX_ATTEMPTS_PER_QUESTION = 4;
+  const MIN_AUTO_CONFIDENCE = 0.6;
+  // Background tabs: Chrome slows the portal's own timers, so its next question can take much
+  // longer to appear. Give it time before deciding the set is finished.
+  const idleLimitMs = () => (document.hidden ? 180000 : 60000);
+
+  // ---- Diagnostics: loop events go to the backend log (see "AutoLoop" lines there) ----
+  const instanceId = Math.random().toString(36).slice(2, 6);
+  let lastTracedStatus = '';
+  function trace(event: string, data: Record<string, unknown> = {}): void {
+    try {
       chrome.runtime.sendMessage(
         {
           type: 'BACKEND_FETCH',
           payload: {
-            endpoint: '/api/questions/solve',
+            endpoint: '/api/debug/loop-log',
             options: {
               method: 'POST',
               body: JSON.stringify({
-                question: liveQuestion.questionText,
-                options: liveQuestion.options.map((o) => ({ id: o.id, text: o.text })),
-                questionFingerprint: liveQuestion.fingerprint,
-                questionNumber: liveQuestion.questionNumber,
-                isMultipleChoiceMultipleAnswer: liveQuestion.isMultipleChoiceMultipleAnswer,
-                isOrderingQuestion: liveQuestion.isOrderingQuestion,
-                questionType: liveQuestion.questionType,
+                tab: instanceId,
+                page: (document.title || '').slice(0, 40),
+                path: location.pathname.slice(-24),
+                hidden: document.hidden,
+                solved: solvedCount,
+                event,
+                ...data,
               }),
             },
           },
         },
-        resolve,
+        () => void chrome.runtime.lastError,
       );
-    });
-
-    if (!tabAutoLoopActive) {
-      isCycleRunning = false;
-      return;
+    } catch {
+      // never let logging break the loop
     }
-
-    const answer = response?.data?.answer;
-    if (!answer) {
-      tabAutoLoopStatus = 'AI busy / rate-limited. Retrying in 2s...';
-      isCycleRunning = false;
-      if (tabAutoLoopActive) setTimeout(executeTabAutoLoopCycle, 2000);
-      return;
-    }
-
-    // Step 2: Check for Drag & Drop / Step Ordering
-    if (liveQuestion.isOrderingQuestion || (answer.ordered_sequence && answer.ordered_sequence.length > 0)) {
-      const seq =
-        answer.ordered_sequence ||
-        (answer.selected_option_id || '').split(/[,;\->\s]+/).filter(Boolean);
-      tabAutoLoopStatus = `⏸️ Drag & Drop: Order is [${seq.join(' → ')}]. Paused for manual arrange.`;
-      tabAutoLoopActive = false;
-      isCycleRunning = false;
-      return;
-    }
-
-    // Step 3: Match and select options
-    const isMulti = Boolean(liveQuestion.isMultipleChoiceMultipleAnswer);
-    let matchedIdStr = '';
-    if (isMulti) {
-      const multiMatch = matchAIMultipleAnswersToOptions(answer, liveQuestion.options);
-      if (multiMatch.isMatched && multiMatch.matchedIds.length > 0) {
-        interaction.selectMultipleOptions(multiMatch.matchedIds, liveQuestion.options);
-        matchedIdStr = multiMatch.matchedIds.join(', ');
-      }
-    } else {
-      const match = matchAIAnswerToOptions(answer, liveQuestion.options);
-      if (match.isMatched && match.matchedOption) {
-        interaction.selectOption(match.matchedId!, match.matchedOption.elementSelector, match.matchedText!);
-        matchedIdStr = match.matchedId!;
-      }
-    }
-
-    tabAutoLoopStatus = `2. Marked option(s) [${matchedIdStr || answer.selected_option_id}]. Submitting...`;
-    await new Promise((r) => setTimeout(r, 650));
-    if (!tabAutoLoopActive) {
-      isCycleRunning = false;
-      return;
-    }
-
-    // Step 4: Submit Answer
-    await interaction.clickSubmitButton(6000);
-    tabSubmittedFingerprints.add(liveQuestion.fingerprint);
-    tabSolvedCount++;
-
-    await new Promise((r) => setTimeout(r, 700));
-    if (!tabAutoLoopActive) {
-      isCycleRunning = false;
-      return;
-    }
-
-    // Step 5: Click Next
-    tabAutoLoopStatus = '3. Clicking Next question...';
-    await interaction.waitForAndClickNextButton(10000);
-
-    // Step 6: Wait for next question to load
-    await new Promise((r) => setTimeout(r, 1200));
-    isCycleRunning = false;
-    if (tabAutoLoopActive) {
-      executeTabAutoLoopCycle();
-    }
-  } catch (err: any) {
-    tabAutoLoopStatus = `Loop error: ${err.message}. Retrying in 2s...`;
-    isCycleRunning = false;
-    if (tabAutoLoopActive) setTimeout(executeTabAutoLoopCycle, 2000);
   }
+
+  // Errors that retrying cannot fix. The loop must stop and say why.
+  const FATAL_ERROR =
+    /not configured|pairing token|api key|api_key|permission denied|failed to fetch|not reachable|session is (paused|stopped)|extension context invalidated/i;
+  // Gemini busy / rate limited / slow: wait longer and try again, do not give up quickly.
+  const BUSY_ERROR = /429|quota|rate.?limit|resource.?exhausted|overloaded|unavailable|503|timed out|timeout|message port closed/i;
+
+  function startAutoLoop(): void {
+    runId++;
+    loopActive = true;
+    submitted.clear();
+    answers.clear();
+    attempts.clear();
+    failures = 0;
+    busyRetries = 0;
+    idleSince = 0;
+    lowConfidence = 0;
+    loopStatus = 'Auto-Loop starting...';
+    trace('start', { url: location.href.slice(0, 120) });
+    void runCycle(runId);
+  }
+
+  function stopAutoLoop(status: string): void {
+    runId++;
+    loopActive = false;
+    loopStatus = status;
+    trace('stop', { status });
+  }
+
+  function scheduleCycle(run: number, delayMs: number): void {
+    if (cycleRunningFor === run) cycleRunningFor = -1;
+    if (loopStatus !== lastTracedStatus) {
+      lastTracedStatus = loopStatus;
+      trace('status', { status: loopStatus });
+    }
+    const t0 = Date.now();
+    // sleep() keeps working in background tabs, unlike setTimeout
+    sleep(delayMs).then(() => {
+      const late = Date.now() - t0 - delayMs;
+      if (late > 5000) trace('late-wakeup', { delayMs, lateMs: late });
+      if (loopActive && run === runId) void runCycle(run);
+    });
+  }
+
+  async function runCycle(run: number): Promise<void> {
+    if (!loopActive || run !== runId || cycleRunningFor === run) return;
+    cycleRunningFor = run;
+    const alive = () => loopActive && run === runId;
+    const finish = (status: string) => {
+      if (run === runId) stopAutoLoop(status);
+    };
+
+    try {
+      // Work top to bottom through every live question not answered in this run
+      const questions = extractor.extractAllQuestions();
+      const pending = questions.filter((q) => !submitted.has(q.fingerprint));
+      if (pending.length === 0) {
+        if (!idleSince) idleSince = Date.now();
+        // Finish once nothing new shows up (end of the practice set). Before answering
+        // anything, wait longer: the first question may still be loading.
+        const limit = submitted.size > 0 ? idleLimitMs() : idleLimitMs() * 2;
+        if (Date.now() - idleSince > limit) {
+          finish(
+            submitted.size > 0
+              ? `✅ No new questions appeared for ${Math.round(limit / 1000)}s. Auto-Loop finished (${solvedCount} answered${lowConfidence ? `, ${lowConfidence} low-confidence` : ''}).`
+              : '⏸️ No questions found on this page.',
+          );
+          return;
+        }
+        loopStatus = questions.length === 0 ? 'Scanning webpage for questions...' : 'Waiting for next question to render...';
+        scheduleCycle(run, 1000);
+        return;
+      }
+      idleSince = 0;
+
+      const q = pending[0];
+      const shortText = q.questionText.replace(/\s+/g, ' ').slice(0, 45);
+
+      // Loop detector: the same question keeps coming back without being submitted
+      const tries = (attempts.get(q.fingerprint) || 0) + 1;
+      attempts.set(q.fingerprint, tries);
+      if (tries > MAX_ATTEMPTS_PER_QUESTION) {
+        trace('stuck-question', { fp: q.fingerprint, text: q.questionText.slice(0, 160), tries });
+        finish(`⏸️ Stuck on "${shortText}..." (tried ${tries - 1} times without getting past it). Answer it manually, then restart.`);
+        return;
+      }
+
+      // Images / figures / screenshot
+      let images: ResolvedMedia['images'] = [];
+      if ((q.images && q.images.length) || isPlaceholderQuestion(q)) {
+        loopStatus = `1. Reading image(s) for: "${shortText}..."`;
+        const media = await prepareQuestionMedia(q);
+        if (!alive()) return;
+        images = media.images;
+        if (isPlaceholderQuestion(q) && images.length === 0) {
+          finish(
+            `⏸️ This question is an image and could not be read (${media.failures.join('; ') || 'no image found'}). Keep this tab visible in its window so a screenshot can be taken, then restart.`,
+          );
+          return;
+        }
+      }
+
+      loopStatus = `1. Solving with Gemini${images.length ? ` (+${images.length} image)` : ''}: "${shortText}..."`;
+      trace('solve', {
+        fp: q.fingerprint,
+        strategy: q.extractionStrategy,
+        type: q.isOrderingQuestion ? 'ordering' : q.isMultipleChoiceMultipleAnswer ? 'multi' : 'single',
+        text: q.questionText.replace(/\s+/g, ' ').slice(0, 200),
+        options: q.options.map((o) => `${o.id}:${o.text.slice(0, 40)}`),
+        images: images.length,
+        pending: pending.length,
+        cachedLocally: answers.has(q.fingerprint),
+      });
+
+      const cachedAnswer = answers.get(q.fingerprint);
+      const response = cachedAnswer
+        ? { success: true, data: { answer: cachedAnswer, sessionId } }
+        : await backendPost('/api/questions/solve', {
+        sessionId,
+        pageUrl: window.location.href,
+        pageTitle: document.title,
+        question: q.questionText,
+        options: q.options.map((o) => ({ id: o.id, text: o.text })),
+        questionFingerprint: q.fingerprint,
+        questionNumber: q.questionNumber,
+        isMultipleChoiceMultipleAnswer: q.isMultipleChoiceMultipleAnswer,
+        isOrderingQuestion: q.isOrderingQuestion,
+        questionType: q.questionType,
+        images: images.length ? images : undefined,
+      });
+      if (!alive()) return;
+
+      const answer = response?.data?.answer;
+      if (!response?.success || !answer) {
+        const reason = response?.error || 'Backend returned no answer';
+        if (FATAL_ERROR.test(reason)) {
+          finish(`⏸️ Stopped: ${reason}`);
+          return;
+        }
+        if (BUSY_ERROR.test(reason)) {
+          busyRetries++;
+          if (busyRetries > MAX_BUSY_RETRIES) {
+            finish(`⏸️ Gemini is still rate limited after ${MAX_BUSY_RETRIES} retries. Wait a few minutes or switch model. (${reason.slice(0, 120)})`);
+            return;
+          }
+          const wait = Math.min(60000, 4000 * 2 ** (busyRetries - 1));
+          loopStatus = `Gemini busy / rate limited. Retry ${busyRetries}/${MAX_BUSY_RETRIES} in ${Math.round(wait / 1000)}s...`;
+          scheduleCycle(run, wait);
+          return;
+        }
+        failures++;
+        if (failures >= MAX_FAILURES) {
+          finish(`⏸️ Stopped after ${failures} failed attempts: ${reason}`);
+          return;
+        }
+        loopStatus = `Solve failed (${failures}/${MAX_FAILURES}): ${reason}. Retrying...`;
+        scheduleCycle(run, 2500);
+        return;
+      }
+
+      failures = 0;
+      busyRetries = 0;
+      if (response.data.sessionId) sessionId = response.data.sessionId;
+      answers.set(q.fingerprint, answer);
+      trace('answer', {
+        fp: q.fingerprint,
+        id: answer.selected_option_id,
+        text: String(answer.answer_text || '').slice(0, 60),
+        confidence: answer.confidence,
+        needsReview: answer.needs_review,
+        cached: response.data.cached,
+      });
+
+      // Drag & Drop / sequence questions: drag the items into the AI's order, verify, then submit
+      if (q.isOrderingQuestion || (answer.ordered_sequence && answer.ordered_sequence.length > 0)) {
+        const seq: string[] = answer.ordered_sequence || (answer.selected_option_id || '').split(/[,;\->\s]+/).filter(Boolean);
+        const validIds = new Set(q.options.map((o) => o.id));
+        if (seq.length !== q.options.length || seq.some((id) => !validIds.has(id)) || new Set(seq).size !== seq.length) {
+          finish(`⏸️ Sequence answer looks incomplete [${seq.join(' → ')}]. Arrange it manually.`);
+          return;
+        }
+        if (document.hidden) {
+          // Drag libraries animate with requestAnimationFrame, which background tabs pause
+          attempts.set(q.fingerprint, tries - 1); // waiting is not a failed attempt
+          loopStatus = `⏳ Sequence question waiting: switch to this tab so it can drag [${seq.join(' → ')}]`;
+          scheduleCycle(run, 2000);
+          return;
+        }
+        loopStatus = `2. Dragging into order [${seq.join(' → ')}]...`;
+        const reorder = await interaction.reorderOptions(seq, q.options);
+        if (!alive()) return;
+        if (!reorder.success) {
+          finish(`⏸️ ${reorder.message}. Arrange it manually as [${seq.join(' → ')}].`);
+          return;
+        }
+        submitted.add(q.fingerprint);
+        solvedCount++;
+        loopStatus = `2. Arranged [${seq.join(' → ')}]. Submitting...`;
+        await sleep(500);
+        if (!alive()) return;
+        const near = extractor.getQuestionMedia(q.fingerprint)?.region;
+        const submitResult = await interaction.clickSubmitButton(6000, near);
+        await sleep(700);
+        if (!alive()) return;
+        const nextResult = await interaction.waitForAndClickNextButton(10000, near);
+        if (!alive()) return;
+        if (!submitResult.success && !nextResult.success) {
+          finish(`✅ Arranged the sequence. No Submit or Next button found, so nothing was submitted.`);
+          return;
+        }
+        scheduleCycle(run, 1200);
+        return;
+      }
+
+      // Unsure answers are still answered (pausing here stopped the loop every few questions);
+      // they are counted and reported when the loop finishes.
+      const confidence = typeof answer.confidence === 'number' ? answer.confidence : 0;
+      if (answer.needs_review || confidence < MIN_AUTO_CONFIDENCE) lowConfidence++;
+
+      // Match and select
+      let matchedIdStr = '';
+      let selection: { success: boolean; message: string } | null = null;
+      if (q.isMultipleChoiceMultipleAnswer) {
+        const multi = matchAIMultipleAnswersToOptions(answer, q.options);
+        if (multi.isMatched && multi.matchedIds.length > 0) {
+          selection = interaction.selectMultipleOptions(multi.matchedIds, q.options);
+          matchedIdStr = multi.matchedIds.join(', ');
+        }
+      } else {
+        const match = matchAIAnswerToOptions(answer, q.options);
+        if (match.isMatched && match.matchedOption) {
+          selection = interaction.selectOption(match.matchedId!, match.matchedOption.elementSelector, match.matchedText!);
+          matchedIdStr = match.matchedId!;
+        }
+      }
+
+      if (!matchedIdStr) {
+        finish(`⏸️ Could not match the AI answer "${String(answer.answer_text).slice(0, 60)}" to an option on the page. Answer this one manually.`);
+        return;
+      }
+      if (selection && !selection.success) {
+        finish(`⏸️ Could not click option [${matchedIdStr}] on the page: ${selection.message}`);
+        return;
+      }
+
+      submitted.add(q.fingerprint);
+      solvedCount++;
+
+      // More unanswered questions on this page: mark them all before submitting anything
+      const remaining = pending.length - 1;
+      if (remaining > 0) {
+        loopStatus = `2. Marked [${matchedIdStr}]. ${remaining} more on this page...`;
+        scheduleCycle(run, 350);
+        return;
+      }
+
+      loopStatus = `2. Marked option(s) [${matchedIdStr}]. Submitting...`;
+      await sleep(650);
+      if (!alive()) return;
+
+      const near = extractor.getQuestionMedia(q.fingerprint)?.region;
+      const submitResult = await interaction.clickSubmitButton(6000, near);
+      await sleep(700);
+      if (!alive()) return;
+
+      loopStatus = '3. Clicking Next question...';
+      const nextResult = await interaction.waitForAndClickNextButton(10000, near);
+      if (!alive()) return;
+
+      if (!submitResult.success && !nextResult.success) {
+        finish(`✅ Marked ${solvedCount} answer(s). No Submit or Next button found, so nothing was submitted.`);
+        return;
+      }
+
+      scheduleCycle(run, 1200);
+    } catch (err: any) {
+      if (!alive()) return;
+      failures++;
+      if (failures >= MAX_FAILURES) {
+        finish(`⏸️ Stopped after repeated errors: ${err?.message || err}`);
+        return;
+      }
+      loopStatus = `Loop error: ${err?.message || err}. Retrying in 2s...`;
+      scheduleCycle(run, 2000);
+    }
+  }
+
+  // Rescan on URL changes in single page apps (SPA)
+  window.addEventListener('popstate', () => observer.scan(true));
+  window.addEventListener('hashchange', () => observer.scan(true));
 }
-
-// Rescan on URL changes in single page apps (SPA)
-window.addEventListener('popstate', () => observer.scan(true));
-window.addEventListener('hashchange', () => observer.scan(true));
-

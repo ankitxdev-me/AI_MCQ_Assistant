@@ -1,19 +1,127 @@
 import { ExtractedQuestion, OptionItem } from '@ai-mcq/shared-types';
 import { createQuestionFingerprint } from './fingerprint';
+import { isRendered, isOptionRendered } from './visibility';
+import { collectQuestionContext, resolveOptionElement, nearbyQuestionText } from './media';
+
+/** Prompt used when a question exists only as an image or figure. */
+export const VISUAL_PLACEHOLDER_PROMPT = 'Answer the question shown in the attached image or figure.';
+const VISUAL_SELECTOR = 'img, svg, canvas, table, pre, .cm-editor, .CodeMirror, .monaco-editor, .ace_editor';
+
+export interface QuestionMediaHandle {
+  region: Element;
+  imageElements: Element[];
+}
 
 export class DOMQuestionExtractor {
+  /** Live elements behind each question from the latest scan, keyed by fingerprint. */
+  private questionMedia = new Map<string, QuestionMediaHandle>();
+
+  public getQuestionMedia(fingerprint: string): QuestionMediaHandle | undefined {
+    return this.questionMedia.get(fingerprint);
+  }
+
+  /**
+   * A real question mark, not the "?" inside a URL such as
+   * "https://www.googletagmanager.com/ns.html?id=GTM-XXXX".
+   */
+  public hasQuestionMark(text: string): boolean {
+    return /\?(?=\s|$|["'”’)\]])/.test(text);
+  }
+
+  /**
+   * Could this element hold the question prompt? Rejects hidden nodes and non-content markup.
+   * Pages often carry a Google Tag Manager <noscript><iframe src="...?id=GTM-..."> snippet; its
+   * text used to be picked up as the "question", so Gemini answered from the options alone.
+   */
+  private isPromptCandidate(el: Element): boolean {
+    if (el.closest('script, style, noscript, template, iframe, header, nav, footer, [role="banner"], [role="navigation"], #ai-mcq-assistant-root')) {
+      return false;
+    }
+    const text = el.textContent || '';
+    if (/<\/?[a-z][a-z0-9-]*[\s>]/i.test(text)) return false; // raw HTML/markup as text
+    if (/questions?\s+attempted/i.test(text)) return false;
+    return isRendered(el);
+  }
+
+  /** True when the prompt is a stand-in because the real question is visual. */
+  public static isPlaceholderPrompt(text: string): boolean {
+    const t = text.trim();
+    return t === VISUAL_PLACEHOLDER_PROMPT || /^question \d+$/i.test(t) || t.length < 5;
+  }
+
+  /**
+   * Adds tables, code and images around the question to its text and fingerprint.
+   * Without this, "What is the output of this code?" asked twice with different code looked
+   * like one already-answered question and the Auto-Loop stalled.
+   */
+  private attachRichContext(q: ExtractedQuestion, media: Map<string, QuestionMediaHandle>): void {
+    const els = q.options
+      .map((o) => resolveOptionElement(o.elementSelector))
+      .filter((e): e is Element => !!e);
+    if (els.length === 0) return;
+
+    const ctx = collectQuestionContext(els, q.options.map((o) => o.id));
+    if (!ctx) return;
+
+    // True/False statements and other prompts without a "?" often fall back to "Question N".
+    // Then every such question looks identical, the Auto-Loop thinks it already answered it and
+    // stalls. Read the statement from the text around the options instead.
+    if (DOMQuestionExtractor.isPlaceholderPrompt(q.questionText)) {
+      const nearby = nearbyQuestionText(els, ctx.region);
+      if (nearby) {
+        q.questionText = nearby;
+        q.fingerprint = createQuestionFingerprint(nearby, q.options);
+      }
+    }
+
+    const newBlocks = ctx.textBlocks.filter((b) => {
+      const body = b.slice(b.indexOf('\n') + 1).trim().slice(0, 80);
+      return body.length > 0 && !q.questionText.includes(body);
+    });
+    if (newBlocks.length > 0) {
+      q.questionText = `${q.questionText}\n\n${newBlocks.join('\n\n')}`;
+    }
+    if (ctx.images.length > 0) {
+      q.images = ctx.images;
+      q.hasVisualContent = true;
+    }
+    if (ctx.contextKey) {
+      q.fingerprint = createQuestionFingerprint(`${q.questionText} ${ctx.contextKey}`, q.options);
+    }
+    media.set(q.fingerprint, { region: ctx.region, imageElements: ctx.imageElements });
+  }
+
   /**
    * Main entry point: extracts questions from the current document.
    */
   public extractAllQuestions(): ExtractedQuestion[] {
     const results: ExtractedQuestion[] = [];
     const seenFingerprints = new Set<string>();
+    const seenOptionElements = new Set<Element>();
+    const anchors = new Map<ExtractedQuestion, Element>();
+
+    const media = new Map<string, QuestionMediaHandle>();
 
     const addQuestion = (q: ExtractedQuestion) => {
-      if (!seenFingerprints.has(q.fingerprint)) {
-        seenFingerprints.add(q.fingerprint);
-        results.push(q);
+      // Two strategies can find the same control (e.g. a .question-card that wraps a
+      // role="radiogroup"). Their prompt text differs slightly, so the fingerprint does
+      // not catch it. Dedupe on the actual first-option element instead.
+      const anchor = this.resolveUniqueElement(q.options[0]?.elementSelector);
+      if (anchor && seenOptionElements.has(anchor)) return;
+
+      try {
+        this.attachRichContext(q, media);
+      } catch {
+        // Context is a bonus; never lose the question over it
       }
+
+      if (seenFingerprints.has(q.fingerprint)) return;
+      if (anchor) {
+        seenOptionElements.add(anchor);
+        anchors.set(q, anchor);
+      }
+      seenFingerprints.add(q.fingerprint);
+      results.push(q);
     };
 
     // Strategy 1: Explicit question containers (.question, .mcq, [data-question], fieldset)
@@ -40,6 +148,12 @@ export class DOMQuestionExtractor {
       }
     }
 
+    // Strategy 4b: True / False drawn as buttons or cards instead of radio inputs
+    if (results.length === 0) {
+      const binary = this.extractTrueFalseButtons();
+      if (binary) addQuestion(binary);
+    }
+
     // Strategy 5: Drag & Drop / Step Ordering Questions (if no standard MCQs detected)
     if (results.length === 0) {
       const orderingQuestion = this.extractOrderingQuestion();
@@ -48,7 +162,33 @@ export class DOMQuestionExtractor {
       }
     }
 
+    this.questionMedia = media;
+
+    // Keep page order so questions[0] is always the top-most live question
+    results.sort((a, b) => {
+      const ea = anchors.get(a);
+      const eb = anchors.get(b);
+      if (!ea || !eb || ea === eb) return 0;
+      const pos = ea.compareDocumentPosition(eb);
+      if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+      if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+      return 0;
+    });
+
     return results;
+  }
+
+  /**
+   * Resolves a selector only when it points at exactly one element.
+   */
+  private resolveUniqueElement(selector?: string): Element | null {
+    if (!selector) return null;
+    try {
+      const matches = document.querySelectorAll(selector);
+      return matches.length === 1 ? matches[0] : null;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -70,6 +210,8 @@ export class DOMQuestionExtractor {
 
     const elements = document.querySelectorAll(selectors.join(', '));
     elements.forEach((container, idx) => {
+      if (!isRendered(container)) return;
+
       // If container contains child question elements, skip parent wrapper to avoid lumping sub-questions
       if (container.querySelector(selectors.join(', '))) {
         return;
@@ -98,7 +240,7 @@ export class DOMQuestionExtractor {
       // 2. Find real question text: must NOT match any of the options
       let rawText = '';
       const dedicatedElem = container.querySelector(
-        '.question-text, .q-text, .prompt, [data-question-text], legend, h1, h2, h3, h4',
+        '.question-text, .question-title, .q-text, .prompt, [data-question-text], legend, h1, h2, h3, h4',
       );
       if (dedicatedElem && !dedicatedElem.querySelector('input')) {
         const text = this.cleanText(dedicatedElem.textContent || '');
@@ -108,7 +250,7 @@ export class DOMQuestionExtractor {
       }
 
       // 3. If no dedicated element or text is in optionTexts, search for element with '?'
-      if (!rawText || optionTexts.includes(rawText.toLowerCase()) || !rawText.includes('?')) {
+      if (!rawText || optionTexts.includes(rawText.toLowerCase()) || !this.hasQuestionMark(rawText)) {
         const firstInput = container.querySelector<HTMLElement>('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]') || (container as HTMLElement);
         const realPrompt = this.findRealQuestionPrompt(firstInput, options);
         if (realPrompt) {
@@ -116,9 +258,11 @@ export class DOMQuestionExtractor {
         }
       }
 
-      // 4. Validate question text: must be >= 5 chars and NOT an option
+      // 4. Validate question text: must be >= 5 chars and NOT an option.
+      //    Image-only questions have no text prompt; keep them and let the image carry it.
       if (!rawText || rawText.length < 5 || optionTexts.includes(rawText.toLowerCase())) {
-        return;
+        if (!container.querySelector(VISUAL_SELECTOR)) return;
+        rawText = VISUAL_PLACEHOLDER_PROMPT;
       }
 
       const { questionNumber, questionText } = this.parseQuestionNumberAndText(rawText, idx + 1);
@@ -154,7 +298,7 @@ export class DOMQuestionExtractor {
     // Filter out hidden radios and extension container
     const visibleRadios = allRadios.filter((r) => {
       if (r.closest('#ai-mcq-assistant-root') || r.closest('.ai-mcq-container')) return false;
-      return true;
+      return isOptionRendered(r);
     });
 
     if (visibleRadios.length === 0) return [];
@@ -192,7 +336,7 @@ export class DOMQuestionExtractor {
 
       // If extracted question text is identical to one of the options or empty, use deep prompt finder
       const optionTexts = options.map((o) => o.text.trim().toLowerCase());
-      if (!questionText || optionTexts.includes(questionText.trim().toLowerCase()) || !questionText.includes('?')) {
+      if (!questionText || optionTexts.includes(questionText.trim().toLowerCase()) || !this.hasQuestionMark(questionText)) {
         const betterPrompt = this.findRealQuestionPrompt(groupRadios[0], options);
         if (betterPrompt) {
           questionText = betterPrompt;
@@ -240,7 +384,7 @@ export class DOMQuestionExtractor {
 
     const visibleCheckboxes = allCheckboxes.filter((cb) => {
       if (cb.closest('#ai-mcq-assistant-root') || cb.closest('.ai-mcq-container')) return false;
-      return true;
+      return isOptionRendered(cb);
     });
 
     if (visibleCheckboxes.length === 0) return [];
@@ -276,7 +420,7 @@ export class DOMQuestionExtractor {
       }
 
       const optionTexts = options.map((o) => o.text.trim().toLowerCase());
-      if (!questionText || optionTexts.includes(questionText.trim().toLowerCase()) || !questionText.includes('?')) {
+      if (!questionText || optionTexts.includes(questionText.trim().toLowerCase()) || !this.hasQuestionMark(questionText)) {
         const betterPrompt = this.findRealQuestionPrompt(groupCheckboxes[0], options);
         if (betterPrompt) {
           questionText = betterPrompt;
@@ -332,8 +476,10 @@ export class DOMQuestionExtractor {
     }
 
     const allHaveNames = radios.every((r) => r.name && r.name.trim().length > 0);
-    // If every radio has a distinct name, there are multiple groups, and each group has <= 6 radios
-    if (allHaveNames && byName.size > 1 && Array.from(byName.values()).every((g) => g.length <= 6)) {
+    // Every radio is named and each name group is a plausible option list: group by name.
+    // (This used to require 2+ groups. With a single question on the page, the 4 radios
+    // were split by "nearest heading" instead, and the first option was silently dropped.)
+    if (allHaveNames && Array.from(byName.values()).every((g) => g.length >= 2 && g.length <= 8)) {
       return Array.from(byName.values()).map((groupRadios) => ({
         promptText: '',
         radios: groupRadios,
@@ -398,9 +544,10 @@ export class DOMQuestionExtractor {
           for (let i = headings.length - 1; i >= 0; i--) {
             const h = headings[i];
             if (h.querySelector('input[type="radio"]')) continue;
+            if (!this.isPromptCandidate(h)) continue;
             const txt = this.cleanText(h.textContent || '');
             if (
-              (txt.includes('?') ||
+              (this.hasQuestionMark(txt) ||
                 txt.toLowerCase().includes('blank') ||
                 txt.toLowerCase().includes('which word') ||
                 /^(?:question|q)\s*\d+/i.test(txt)) &&
@@ -430,6 +577,7 @@ export class DOMQuestionExtractor {
     const ariaGroups = document.querySelectorAll('[role="radiogroup"]');
 
     ariaGroups.forEach((group, idx) => {
+      if (!isRendered(group)) return;
       const ariaRadios = group.querySelectorAll('[role="radio"]');
       if (ariaRadios.length < 2) return;
 
@@ -499,7 +647,7 @@ export class DOMQuestionExtractor {
     const radios = Array.from(main.querySelectorAll<HTMLElement>('input[type="radio"], [role="radio"]'));
 
     const isCheckboxMode = checkboxes.length >= 2 && (radios.length < 2 || checkboxes.length >= radios.length);
-    const inputElements = isCheckboxMode ? checkboxes : radios;
+    const inputElements = (isCheckboxMode ? checkboxes : radios).filter((el) => isOptionRendered(el));
     if (inputElements.length < 2) return null;
 
     // 1. Extract options first so we can cross-reference
@@ -542,7 +690,8 @@ export class DOMQuestionExtractor {
     }
 
     if (!text || text.length < 5 || optionTexts.includes(text.toLowerCase())) {
-      return null;
+      if (!main.querySelector(VISUAL_SELECTOR)) return null;
+      text = VISUAL_PLACEHOLDER_PROMPT;
     }
 
     const { questionNumber, questionText } = this.parseQuestionNumberAndText(text, 1);
@@ -609,6 +758,57 @@ export class DOMQuestionExtractor {
     cleaned = cleaned.replace(/1\s*[A-Z][a-z].*$/, '').trim();
 
     return cleaned;
+  }
+
+  /**
+   * Strategy 4b: a True/False question whose answers are buttons or clickable cards.
+   */
+  private extractTrueFalseButtons(): ExtractedQuestion | null {
+    const CLICKABLE = 'button, [role="button"], [role="option"], [role="radio"], label, li, [class*="option" i], [class*="choice" i]';
+    const wordOf = (el: Element) =>
+      this.cleanText(el.textContent || '')
+        .toLowerCase()
+        .replace(/^\(?[a-d][\)\.:]\s*/, '')
+        .replace(/[.!]$/, '');
+
+    const found: Record<'true' | 'false', HTMLElement[]> = { true: [], false: [] };
+    const all = Array.from(document.querySelectorAll<HTMLElement>('button, [role="button"], [role="option"], [role="radio"], label, li, div, span, p'));
+    for (const el of all) {
+      if (el.closest('#ai-mcq-assistant-root, header, nav, footer, [role="dialog"]')) continue;
+      const w = wordOf(el);
+      if (w !== 'true' && w !== 'false') continue;
+      // innermost element with the word, then its clickable wrapper
+      if (Array.from(el.children).some((c) => wordOf(c) === w)) continue;
+      const clickable = (el.closest(CLICKABLE) as HTMLElement) || el;
+      if (!isRendered(clickable) || wordOf(clickable) !== w) continue;
+      if (!found[w].includes(clickable)) found[w].push(clickable);
+    }
+    if (found.true.length !== 1 || found.false.length !== 1) return null;
+
+    const [tEl, fEl] = [found.true[0], found.false[0]];
+    const ordered = tEl.compareDocumentPosition(fEl) & Node.DOCUMENT_POSITION_FOLLOWING ? [tEl, fEl] : [fEl, tEl];
+    const options: OptionItem[] = ordered.map((el, i) => ({
+      id: ['A', 'B'][i],
+      text: wordOf(el) === 'true' ? 'True' : 'False',
+      originalLabel: ['A', 'B'][i],
+      elementSelector: this.generateUniqueSelector(el),
+    }));
+
+    let text = this.findRealQuestionPrompt(ordered[0], options);
+    if (!text || text.length < 5) text = 'Question 1';
+    const { questionNumber, questionText } = this.parseQuestionNumberAndText(text, 1);
+    return {
+      fingerprint: createQuestionFingerprint(questionText, options),
+      questionNumber,
+      questionText,
+      options,
+      extractionStrategy: 'custom-accessible',
+      extractionConfidence: 0.85,
+      isMultipleChoiceMultipleAnswer: false,
+      questionType: 'SINGLE_CHOICE',
+      status: 'READY_FOR_AI',
+      detectedAt: new Date().toISOString(),
+    };
   }
 
   /**
@@ -681,6 +881,24 @@ export class DOMQuestionExtractor {
       }
     }
 
+    // Fallback: no recognisable wording, but the page clearly has a sortable list
+    // (react-beautiful-dnd / hello-pangea / dnd-kit / HTML5 draggable). Use the nearest prompt.
+    if (!promptEl || !rawQuestionText || rawQuestionText.length < 10) {
+      const firstDraggable = main.querySelector<HTMLElement>(
+        '[data-rbd-draggable-id], [data-rfd-draggable-id], [aria-roledescription="sortable"], [aria-roledescription="draggable"], [draggable="true"]',
+      );
+      const draggableCount = main.querySelectorAll(
+        '[data-rbd-draggable-id], [data-rfd-draggable-id], [aria-roledescription="sortable"], [aria-roledescription="draggable"], [draggable="true"]',
+      ).length;
+      if (firstDraggable && draggableCount >= 2 && isRendered(firstDraggable)) {
+        const prompt = this.sanitizeQuestionPrompt(this.findRealQuestionPrompt(firstDraggable, []));
+        if (prompt.length >= 10) {
+          rawQuestionText = prompt;
+          promptEl = firstDraggable;
+        }
+      }
+    }
+
     if (!promptEl || !rawQuestionText || rawQuestionText.length < 10) return null;
 
     // 2. Discover draggable items in DOM
@@ -710,6 +928,13 @@ export class DOMQuestionExtractor {
           .map((h) => h.closest<HTMLElement>('[data-rbd-draggable-id], [data-rfd-draggable-id]') || (h.parentElement as HTMLElement))
           .filter(Boolean);
       }
+    }
+
+    // dnd-kit sortable items
+    if (draggableElements.length < 2) {
+      draggableElements = Array.from(
+        main.querySelectorAll<HTMLElement>('[aria-roledescription="sortable"], [aria-roledescription="draggable"]'),
+      );
     }
 
     // Check HTML5 draggable: [draggable="true"]
@@ -771,7 +996,8 @@ export class DOMQuestionExtractor {
         !lower.startsWith('skip') &&
         !lower.startsWith('instructions') &&
         !lower.includes('drag and drop to order') &&
-        el.clientHeight > 15
+        el.clientHeight > 15 &&
+        isRendered(el)
       );
     });
 
@@ -783,7 +1009,7 @@ export class DOMQuestionExtractor {
       let rawText = this.cleanText(itemEl.textContent || '');
       // Strip leading number or drag handle icons (e.g. "1 Continue switching..." or "1 :: Continue...")
       rawText = rawText.replace(/^\d+[\s\:\.\-\:\:\•]+\s*/, '');
-      rawText = rawText.replace(/^[\:\:\.\•\s]+/, '').trim();
+      rawText = rawText.replace(/^[^\p{L}\p{N}"'(\[]+/u, '').trim(); // drag-handle glyphs like ⋮⋮
 
       const optionId = String(idx + 1);
       options.push({
@@ -816,19 +1042,12 @@ export class DOMQuestionExtractor {
   public isOrderingPrompt(text: string): boolean {
     const lower = text.toLowerCase();
     return (
-      lower.includes('rearrange the following') ||
-      lower.includes('arrange the following') ||
-      lower.includes('drag and drop to order') ||
-      lower.includes('drag and drop') ||
-      lower.includes('order the following') ||
-      lower.includes('put the following in order') ||
-      lower.includes('sort the following') ||
-      lower.includes('sequence the following') ||
-      lower.includes('correct sequence') ||
-      lower.includes('correct order') ||
-      lower.includes('rearrange the steps') ||
-      lower.includes('arrange the steps') ||
-      lower.includes('order the steps') ||
+      /\b(re)?arrange\b/.test(lower) ||
+      /\bdrag\b/.test(lower) ||
+      /\b(in|into) (the )?(correct |right |proper |logical |chronological )?(sequence|order)\b/.test(lower) ||
+      /\b(order|sort|sequence) (the|these) (following|steps|items|options|statements|events)\b/.test(lower) ||
+      /\bput (the following|these)\b.*\b(order|sequence)\b/.test(lower) ||
+      /\b(correct|right|proper) (sequence|order)\b/.test(lower) ||
       lower.includes('chronological order')
     );
   }
@@ -898,7 +1117,7 @@ export class DOMQuestionExtractor {
     );
 
     const isCheckboxMode = checkboxes.length >= 2 && (radios.length < 2 || checkboxes.length >= radios.length);
-    const inputElements = isCheckboxMode ? checkboxes : radios;
+    const inputElements = (isCheckboxMode ? checkboxes : radios).filter((el) => isOptionRendered(el));
 
     if (inputElements.length >= 2) {
       inputElements.forEach((inputEl, idx) => {
@@ -1024,7 +1243,7 @@ export class DOMQuestionExtractor {
     for (const cand of Array.from(candidates)) {
       if (cand.querySelector('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]')) continue;
       const text = this.cleanText(cand.textContent || '');
-      if (text.includes('?') && text.length > 10 && !optionTexts.includes(text.toLowerCase())) {
+      if (this.hasQuestionMark(text) && text.length > 10 && !optionTexts.includes(text.toLowerCase())) {
         return text;
       }
     }
@@ -1046,33 +1265,53 @@ export class DOMQuestionExtractor {
   public findRealQuestionPrompt(firstInput: HTMLElement, options: OptionItem[]): string {
     const optionTexts = options.map((o) => this.cleanText(o.text).toLowerCase());
 
+    // Code blocks, tables and figures are question context, never the prompt itself
+    const CONTEXT_ONLY = 'pre, code, table, img, svg, canvas, .cm-editor, .CodeMirror, .monaco-editor, .ace_editor';
+    const isContextOnly = (el: Element) => el.matches(CONTEXT_ONLY) || (!!el.querySelector(CONTEXT_ONLY) && this.cleanText(el.textContent || '').length > 0 &&
+      Array.from(el.querySelectorAll(CONTEXT_ONLY)).reduce((n, c) => n + this.cleanText(c.textContent || '').length, 0) >= this.cleanText(el.textContent || '').length * 0.8);
+
     // Traverse upwards from firstInput to find enclosing question card
     let node: HTMLElement | null = firstInput.parentElement;
     while (node && node !== document.body) {
-      // 1. Look backwards among preceding siblings of node and their children
+      // 1. Look backwards among preceding siblings of node and their children.
+      //    A "?" prompt anywhere at this level beats the nearest plain-text block.
+      let fallback = '';
       let sibling = node.previousElementSibling;
       while (sibling) {
+        // Skip code/figures, hidden nodes, and page chrome (nav bars, "QUESTIONS ATTEMPTED: 2/9")
+        if (
+          isContextOnly(sibling) ||
+          !this.isPromptCandidate(sibling) ||
+          sibling.matches('header, nav, footer, aside, [role="banner"], [role="navigation"]') ||
+          /questions?\s+attempted|end\s+(practice|test|exam)/i.test(sibling.textContent || '')
+        ) {
+          sibling = sibling.previousElementSibling;
+          continue;
+        }
         if (!sibling.querySelector('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]')) {
           const text = this.cleanText(sibling.textContent || '');
-          if (text.includes('?') && text.length >= 8 && !optionTexts.includes(text.toLowerCase())) {
+          if (this.hasQuestionMark(text) && text.length >= 8 && !optionTexts.includes(text.toLowerCase())) {
             return text;
           }
 
           // Check inner elements of sibling
-          const childPrompts = Array.from(sibling.querySelectorAll<HTMLElement>('div, p, span, h1, h2, h3, h4'));
+          const childPrompts = Array.from(sibling.querySelectorAll<HTMLElement>('div, p, span, h1, h2, h3, h4')).filter(
+            (c) => this.isPromptCandidate(c),
+          );
           for (let i = childPrompts.length - 1; i >= 0; i--) {
             const childText = this.cleanText(childPrompts[i].textContent || '');
-            if (childText.includes('?') && childText.length >= 8 && !optionTexts.includes(childText.toLowerCase())) {
+            if (this.hasQuestionMark(childText) && childText.length >= 8 && !optionTexts.includes(childText.toLowerCase())) {
               return childText;
             }
           }
 
-          if (text.length >= 10 && !optionTexts.includes(text.toLowerCase())) {
-            return text;
+          if (!fallback && text.length >= 10 && !optionTexts.includes(text.toLowerCase())) {
+            fallback = text;
           }
         }
         sibling = sibling.previousElementSibling;
       }
+      if (fallback) return fallback;
 
       // 2. Check preceding elements inside node before firstInput
       const allInside = Array.from(node.querySelectorAll<HTMLElement>('*'));
@@ -1083,8 +1322,9 @@ export class DOMQuestionExtractor {
       for (let i = preceding.length - 1; i >= 0; i--) {
         const el = preceding[i];
         if (el.querySelector('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]')) continue;
+        if (!this.isPromptCandidate(el)) continue;
         const text = this.cleanText(el.textContent || '');
-        if (text.includes('?') && text.length >= 8 && !optionTexts.includes(text.toLowerCase())) {
+        if (this.hasQuestionMark(text) && text.length >= 8 && !optionTexts.includes(text.toLowerCase())) {
           return text;
         }
       }
@@ -1095,6 +1335,7 @@ export class DOMQuestionExtractor {
       );
       for (const h of headings) {
         if (h.querySelector('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]')) continue;
+        if (!this.isPromptCandidate(h)) continue;
         const text = this.cleanText(h.textContent || '');
         if (text.length >= 8 && !optionTexts.includes(text.toLowerCase())) {
           return text;
@@ -1219,7 +1460,7 @@ export class DOMQuestionExtractor {
 
     for (const sel of passageSelectors) {
       const el = document.querySelector<HTMLElement>(sel);
-      if (el && !el.closest('#ai-mcq-assistant-root')) {
+      if (el && !el.closest('#ai-mcq-assistant-root') && isRendered(el)) {
         // Ensure element doesn't contain radio buttons, textareas, or input fields
         if (!el.querySelector('input[type="radio"], [role="radio"], textarea, input[type="text"], input[type="number"]')) {
           const txt = this.cleanMultilineText(el.innerText || el.textContent || '');
@@ -1230,36 +1471,53 @@ export class DOMQuestionExtractor {
       }
     }
 
-    // 2. Multi-column / split layout detection (e.g. flex or grid columns)
+    // 2. Split-pane layout detection: a text-only column rendered BESIDE the question column.
+    //    Page headers, nav bars and wizard controls sit above/below the question, not beside it,
+    //    so they must never be mistaken for a reading passage.
     if (questionElement) {
+      let column: Element = questionElement;
       let parent: Element | null = questionElement.parentElement;
       while (parent && parent !== document.body) {
         const children = Array.from(parent.children);
 
-        // If this container has 2+ columns/children, check the other columns for reading content
         if (children.length >= 2) {
+          const colRect = column.getBoundingClientRect();
           for (const child of children) {
-            if (child.contains(questionElement)) continue;
-            // Ignore prompt or label siblings of input
-            if (child.matches('label, h1, h2, h3, h4, h5, .prompt, .question-title, .question-text, .q-text')) {
+            if (child === column || child.contains(questionElement)) continue;
+            if (
+              child.matches(
+                'label, h1, h2, h3, h4, h5, header, nav, footer, aside, button, .prompt, .question-title, .question-text, .q-text',
+              )
+            ) {
               continue;
             }
-            // Check if this sibling column contains question inputs or palette
-            const hasInputs = child.querySelector(
-              'input[type="radio"], [role="radio"], textarea, input[type="text"], input[type="number"]',
-            );
+            if (!isRendered(child)) continue;
+
+            const CONTROLS_OR_EDITOR =
+              'input, textarea, select, button, [role="radio"], [role="checkbox"], [role="button"], .cm-editor, .CodeMirror, .monaco-editor, .ace_editor, pre';
+            const hasControls = child.matches(CONTROLS_OR_EDITOR) || child.querySelector(CONTROLS_OR_EDITOR);
             const isPalette = child.querySelector(
               '.palette, [class*="palette"], [class*="question-nav"], [id*="palette"]',
             );
-            if (!hasInputs && !isPalette) {
-              const text = this.cleanMultilineText((child as HTMLElement).innerText || child.textContent || '');
-              if (text.length >= 40) {
-                return text;
-              }
+            if (hasControls || isPalette) continue;
+
+            const rect = child.getBoundingClientRect();
+            const sideBySide =
+              rect.width > 0 &&
+              colRect.width > 0 &&
+              (rect.right <= colRect.left + 4 || rect.left >= colRect.right - 4) &&
+              rect.top < colRect.bottom &&
+              rect.bottom > colRect.top;
+            if (!sideBySide) continue;
+
+            const text = this.cleanMultilineText((child as HTMLElement).innerText || child.textContent || '');
+            if (text.length >= 120) {
+              return text;
             }
           }
         }
 
+        column = parent;
         parent = parent.parentElement;
       }
     }
@@ -1273,6 +1531,7 @@ export class DOMQuestionExtractor {
       ) {
         continue;
       }
+      if (!isRendered(div)) continue;
 
       const raw = div.innerText || div.textContent || '';
       if (

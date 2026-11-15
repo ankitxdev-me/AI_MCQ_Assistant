@@ -58,40 +58,45 @@ export const App: React.FC = () => {
     }
   }, [detectedQuestions, session?.questions]);
 
-  // Helper: Locates the actual target browser tab (works across standalone popup windows, sidepanels, and multiple tabs)
+  // Window this panel belongs to (side panel). Used so tab switches in OTHER windows are ignored.
+  const ownWindowIdRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!isStandalone && typeof chrome !== 'undefined' && chrome.windows?.getCurrent) {
+      chrome.windows.getCurrent().then((w) => {
+        ownWindowIdRef.current = w?.id ?? null;
+      });
+    }
+  }, [isStandalone]);
+
+  const isWebTab = (t?: chrome.tabs.Tab | null) =>
+    !!t?.url && !t.url.startsWith('chrome-extension://') && !t.url.startsWith('chrome://');
+
+  /**
+   * The tab this panel controls.
+   * Side panel: the active tab of the window the panel lives in.
+   * Pop-out window: the active tab of the last focused normal browser window.
+   * (Before, "any active tab in any window" was used, so with two windows open the panel
+   * could start, stop or read the Auto-Loop of a tab in the other window.)
+   */
   const getTargetTab = useCallback(async (): Promise<chrome.tabs.Tab | null> => {
     if (typeof chrome === 'undefined' || !chrome.tabs || !chrome.tabs.query) return null;
     try {
-      // 1. Try active tab in the last focused browser window (user's main working window)
-      const lastFocusedTabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-      for (const t of lastFocusedTabs) {
-        if (t.url && !t.url.startsWith('chrome-extension://') && !t.url.startsWith('chrome://')) {
-          return t;
-        }
+      let windowId: number | undefined;
+      if (!isStandalone) {
+        const own = ownWindowIdRef.current ?? (await chrome.windows.getCurrent())?.id;
+        windowId = own ?? undefined;
+      } else {
+        windowId = (await chrome.windows.getLastFocused({ windowTypes: ['normal'] }))?.id;
       }
-
-      // 2. Query all active tabs across all windows (excluding extension internal popups)
-      const allActiveTabs = await chrome.tabs.query({ active: true });
-      for (const t of allActiveTabs) {
-        if (t.url && !t.url.startsWith('chrome-extension://') && !t.url.startsWith('chrome://')) {
-          return t;
-        }
-      }
-
-      // 3. Fallback: query any open tab with http/https or learning portal
-      const allTabs = await chrome.tabs.query({});
-      for (const t of allTabs) {
-        if (t.url && (t.url.includes('ccbp.in') || t.url.startsWith('http://') || t.url.startsWith('https://'))) {
-          if (!t.url.startsWith('chrome-extension://')) {
-            return t;
-          }
-        }
+      if (windowId !== undefined) {
+        const [tab] = await chrome.tabs.query({ active: true, windowId });
+        if (isWebTab(tab)) return tab;
       }
     } catch (e) {
       console.warn('Could not query target tab:', e);
     }
     return null;
-  }, []);
+  }, [isStandalone]);
 
   // Helper to safely send message to the active Chrome tab
   const sendTabMessage = useCallback(
@@ -256,8 +261,11 @@ export const App: React.FC = () => {
     const handleMessage = (message: any, sender: any) => {
       if (message.type === 'DOM_QUESTIONS_EXTRACTED') {
         const { questions, url, title } = message.payload;
-        // Multi-tab isolation: ignore extractions sent from non-active background tabs
+        // Multi-tab isolation: ignore extractions sent from other tabs / other windows
         if (sender?.tab?.id && activeTabInfo?.id && sender.tab.id !== activeTabInfo.id) {
+          return;
+        }
+        if (!isStandalone && ownWindowIdRef.current !== null && sender?.tab?.windowId !== undefined && sender.tab.windowId !== ownWindowIdRef.current) {
           return;
         }
 
@@ -286,6 +294,8 @@ export const App: React.FC = () => {
   // Listen for browser tab changes with complete tab isolation
   useEffect(() => {
     const onTabActivated = async (activeInfo: chrome.tabs.TabActiveInfo) => {
+      // A side panel only follows tabs in its own window
+      if (!isStandalone && ownWindowIdRef.current !== null && activeInfo.windowId !== ownWindowIdRef.current) return;
       try {
         const tab = await chrome.tabs.get(activeInfo.tabId);
         if (tab && tab.id && tab.url && !tab.url.startsWith('chrome-extension://') && !tab.url.startsWith('chrome://')) {
@@ -382,7 +392,14 @@ export const App: React.FC = () => {
         await ApiClient.extractQuestions(currentSessionId, [q]);
       }
 
+      // Images / figures / screenshot of the question, read by the content script
+      const media: any = q.images?.length || /^question \d+$/i.test(q.questionText.trim()) || q.questionText.includes('attached image')
+        ? await sendTabMessage({ type: 'PREPARE_QUESTION_MEDIA', payload: { fingerprint: q.fingerprint } })
+        : null;
+      const images = Array.isArray(media?.images) && media.images.length ? media.images : undefined;
+
       const res = await ApiClient.solveQuestion({
+        images,
         sessionId: currentSessionId,
         question: q.questionText,
         options: q.options.map((o) => ({ id: o.id, text: o.text })),

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AI MCQ Assistant",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Local AI MCQ Assistant with DOM question extraction and structured Gemini reasoning.",
   "permissions": [
     "activeTab",

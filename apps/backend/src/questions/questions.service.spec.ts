@@ -37,7 +37,7 @@ describe('QuestionsService', () => {
     );
 
     // Seed mock config
-    await configService.saveGeminiConfig('mock-api-key', 'gemini-1.5-flash');
+    await configService.saveGeminiConfig('mock-api-key', 'gemini-3.5-flash-lite');
   });
 
   afterAll(() => {
