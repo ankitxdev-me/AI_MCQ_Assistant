@@ -58,6 +58,11 @@ export class DOMQuestionExtractor {
     const els = q.options
       .map((o) => resolveOptionElement(o.elementSelector))
       .filter((e): e is Element => !!e);
+    // Typed-answer questions have no options; the answer box anchors the question instead
+    if (els.length === 0 && q.inputSelector) {
+      const box = resolveOptionElement(q.inputSelector);
+      if (box) els.push(box);
+    }
     if (els.length === 0) return;
 
     const ctx = collectQuestionContext(els, q.options.map((o) => o.id));
@@ -160,6 +165,12 @@ export class DOMQuestionExtractor {
       if (orderingQuestion) {
         addQuestion(orderingQuestion);
       }
+    }
+
+    // Strategy 6: Typed answer ("Enter your answer" box) when there is nothing to click
+    if (results.length === 0) {
+      const typed = this.extractTypedAnswerQuestion();
+      if (typed) addQuestion(typed);
     }
 
     this.questionMedia = media;
@@ -760,6 +771,69 @@ export class DOMQuestionExtractor {
     return cleaned;
   }
 
+  /** Text boxes that could take a typed answer (not search, login, chat or code-editor internals). */
+  public findAnswerBoxes(): HTMLElement[] {
+    return Array.from(
+      document.querySelectorAll<HTMLElement>('textarea, input[type="text"], input[type="number"], input:not([type])'),
+    ).filter((el) => {
+      const field = el as HTMLInputElement | HTMLTextAreaElement;
+      if (field.disabled || field.readOnly) return false;
+      if (
+        el.closest(
+          '#ai-mcq-assistant-root, header, nav, footer, [role="search"], [role="dialog"], .cm-editor, .CodeMirror, .monaco-editor, .ace_editor',
+        )
+      ) {
+        return false;
+      }
+      const hint = [el.getAttribute('placeholder'), el.getAttribute('aria-label'), el.getAttribute('name'), el.id]
+        .filter(Boolean)
+        .join(' ');
+      if (/search|e-?mail|password|user ?name|login|otp|phone|comment|chat|message|feedback|filter|coupon/i.test(hint)) {
+        return false;
+      }
+      return isRendered(el);
+    });
+  }
+
+  /**
+   * Strategy 6: a question answered by typing into a single text box ("Enter your answer").
+   */
+  private extractTypedAnswerQuestion(): ExtractedQuestion | null {
+    const boxes = this.findAnswerBoxes();
+    if (boxes.length !== 1) return null; // several boxes = a form, not one practice question
+    const box = boxes[0];
+
+    const hint = `${box.getAttribute('placeholder') || ''} ${box.getAttribute('aria-label') || ''}`;
+    const hasSubmit = Array.from(
+      document.querySelectorAll<HTMLElement>('button, input[type="submit"], input[type="button"], [role="button"]'),
+    ).some((b) => {
+      const t = this.cleanText(b.textContent || b.getAttribute('value') || '').toLowerCase();
+      return /^(submit|submit answer|check|check answer)$/.test(t) && isRendered(b);
+    });
+    if (!/answer|response|type here|your solution|enter/i.test(hint) && !hasSubmit) return null;
+
+    let text = this.findRealQuestionPrompt(box, []);
+    if (!text || text.length < 5) text = 'Question 1'; // replaced by the nearby statement later
+    const { questionNumber, questionText } = this.parseQuestionNumberAndText(text, 1);
+
+    const field = box as HTMLInputElement | HTMLTextAreaElement;
+    return {
+      fingerprint: createQuestionFingerprint(questionText, []),
+      questionNumber,
+      questionText,
+      options: [],
+      questionCategory: 'FILL_IN_THE_BLANKS',
+      questionType: 'DESCRIPTIVE',
+      extractionStrategy: 'fill-in-the-blank',
+      extractionConfidence: 0.85,
+      inputSelector: this.generateUniqueSelector(box),
+      placeholder: box.getAttribute('placeholder') || undefined,
+      maxLength: field.maxLength > 0 ? field.maxLength : undefined,
+      status: 'READY_FOR_AI',
+      detectedAt: new Date().toISOString(),
+    };
+  }
+
   /**
    * Strategy 4b: a True/False question whose answers are buttons or clickable cards.
    */
@@ -954,8 +1028,10 @@ export class DOMQuestionExtractor {
       }
     }
 
-    // Check child containers below promptEl / caption
-    if (draggableElements.length < 2) {
+    // Plain list below the prompt (no drag-library markers). Only when the wording explicitly
+    // asks to drag/arrange; otherwise any instructions list became a fake sequence question.
+    const explicitDragWording = /\b(drag|re-?arrange|arrange)\b/i.test(rawQuestionText);
+    if (draggableElements.length < 2 && explicitDragWording) {
       let curr: HTMLElement | null = promptEl.parentElement;
       while (curr && curr !== document.body) {
         const candidateContainers = Array.from(curr.querySelectorAll<HTMLElement>('ul, ol, div')).filter((c) => {
@@ -1044,7 +1120,8 @@ export class DOMQuestionExtractor {
     return (
       /\b(re)?arrange\b/.test(lower) ||
       /\bdrag\b/.test(lower) ||
-      /\b(in|into) (the )?(correct |right |proper |logical |chronological )?(sequence|order)\b/.test(lower) ||
+      // "in order" but not the purpose phrase "in order to ..." (e.g. "in order to mark your practice")
+      /\b(in|into) (the )?(correct |right |proper |logical |chronological )?(sequence|order)\b(?! to\b)/.test(lower) ||
       /\b(order|sort|sequence) (the|these) (following|steps|items|options|statements|events)\b/.test(lower) ||
       /\bput (the following|these)\b.*\b(order|sequence)\b/.test(lower) ||
       /\b(correct|right|proper) (sequence|order)\b/.test(lower) ||

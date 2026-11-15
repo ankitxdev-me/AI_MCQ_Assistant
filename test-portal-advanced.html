@@ -91,6 +91,12 @@
       { id: 'multi', type: 'checkbox',
         prompt: 'Which of the following are valid HTTP request methods? (Select all that apply)',
         options: ['GET', 'FETCH', 'POST', 'SEND'], answer: ['GET', 'POST'] },
+      { id: 'typed-prefix', type: 'text',
+        promptHtml: 'In a range query, if <code>prefix = [3, 8, 12, 20]</code> , what is the sum from index <code>1</code> to <code>3</code> ?',
+        answer: '17' },
+      { id: 'typed-code', type: 'text', layout: 'split',
+        prompt: 'What will the following code print? Enter your answer.',
+        code: ['console.log(7 % 3);'], answer: '1' },
       { id: 'sequence', type: 'order',
         prompt: 'Set the following steps in sequence to create and start an Express server.',
         options: ['Call app.listen() with a port number', 'Install the express package using npm', 'Create an app instance by calling express()', 'Import express using require()'],
@@ -107,9 +113,9 @@
       const [order, setOrder] = React.useState(q.options);
       const [verdict, setVerdict] = React.useState(null);
 
-      const ready = q.type === 'order' ? true : q.type === 'checkbox' ? sel.length > 0 : sel !== null;
+      const ready = q.type === 'order' ? true : q.type === 'checkbox' ? sel.length > 0 : q.type === 'text' ? !!(sel || '').trim() : sel !== null;
       const submit = () => {
-        const given = q.type === 'order' ? order : sel;
+        const given = q.type === 'order' ? order : q.type === 'text' ? (sel || '').trim() : sel;
         const ok = JSON.stringify(given) === JSON.stringify(q.answer) ||
           (q.type === 'checkbox' && [...given].sort().join('|') === [...q.answer].sort().join('|'));
         window.__results[q.id] = { given, ok };
@@ -124,6 +130,9 @@
         body = q.options.map((o) => h('label', { className: 'opt', key: o },
           h('input', { type: 'checkbox', checked: sel.includes(o), disabled: verdict !== null,
             onChange: () => setSel((s) => (s.includes(o) ? s.filter((x) => x !== o) : [...s, o])) }), ' ', o));
+      } else if (q.type === 'text') {
+        body = h('textarea', { placeholder: 'Enter your answer', rows: 4, style: { width: '100%', maxWidth: 520 },
+          value: sel || '', disabled: verdict !== null, onChange: (e) => setSel(e.target.value) });
       } else if (q.type === 'tf-buttons') {
         body = h('div', null, q.options.map((o) => h('button', {
           key: o, type: 'button', className: 'tf' + (sel === o ? ' selected' : ''), onClick: () => verdict === null && setSel(o) }, o)));
@@ -150,7 +159,9 @@
           : [h('span', { key: 'v', className: 'verdict' }, verdict ? 'Correct!' : 'Wrong answer'),
              h('button', { key: 'n', className: 'btn', onClick: () => onSubmit(false) }, 'NEXT')]);
 
-      const promptEl = q.prompt ? h('p', { className: 'prompt' }, q.prompt) : null;
+      const promptEl = q.promptHtml
+        ? h('p', { className: 'prompt', dangerouslySetInnerHTML: { __html: q.promptHtml } })
+        : q.prompt ? h('p', { className: 'prompt' }, q.prompt) : null;
       const tableEl = q.table ? h('table', null, h('tbody', null, q.table.map((row, r) =>
         h('tr', { key: r }, row.map((c, i) => h(r === 0 ? 'th' : 'td', { key: i }, c)))))) : null;
       const imageEl = q.image ? h('img', { src: IMAGE_URL, alt: '', width: 420, height: 140, style: { display: 'block', marginBottom: 16 } }) : null;

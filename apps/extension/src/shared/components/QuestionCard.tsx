@@ -48,6 +48,7 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({
   const [feedback, setFeedback] = useState<string | null>(null);
 
   const aiAnswer = question.aiAnswer;
+  const isTyped = question.questionType === 'DESCRIPTIVE' && question.options.length === 0;
 
   const handleConfirm = async (optionId: string, selector?: string, text?: string) => {
     setIsConfirming(true);
@@ -95,7 +96,11 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({
           <span className="text-xs font-semibold px-2 py-0.5 rounded bg-blue-100 text-blue-800">
             Q{question.questionNumber || currentIndex} of {totalQuestions}
           </span>
-          {question.isOrderingQuestion ? (
+          {isTyped ? (
+            <span className="text-[11px] font-semibold px-2 py-0.5 rounded bg-amber-100 text-amber-800 border border-amber-200">
+              ✎ Typed Answer
+            </span>
+          ) : question.isOrderingQuestion ? (
             <span className="text-[11px] font-semibold px-2 py-0.5 rounded bg-indigo-100 text-indigo-800 border border-indigo-200">
               ⇅ Drag & Drop Ordering
             </span>
@@ -236,7 +241,9 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({
             <div className="flex items-center justify-between">
               <span className="text-xs font-semibold text-blue-900 flex items-center gap-1.5">
                 <Sparkles className="h-3.5 w-3.5 text-blue-600" />
-                {question.isOrderingQuestion
+                {isTyped
+                  ? `Answer to type: ${aiAnswer.answer_text}`
+                  : question.isOrderingQuestion
                   ? `Recommended Order: ${(aiAnswer.ordered_sequence || [aiAnswer.selected_option_id]).join(' → ')}`
                   : question.isMultipleChoiceMultipleAnswer
                   ? `Recommended: Options ${aiAnswer.selected_option_id}`
@@ -367,6 +374,11 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({
             ) : (
               <button
                 onClick={() => {
+                  if (isTyped) {
+                    // 'TEXT' tells the content script to type answer_text into the answer box
+                    handleConfirm('TEXT', question.inputSelector, aiAnswer.answer_text);
+                    return;
+                  }
                   const opt = question.options.find(
                     (o) => o.id === aiAnswer.selected_option_id,
                   );
@@ -380,7 +392,9 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({
                 ) : (
                   <MousePointerClick className="h-3.5 w-3.5" />
                 )}
-                {question.isMultipleChoiceMultipleAnswer
+                {isTyped
+                  ? '1. Type Answer into Page'
+                  : question.isMultipleChoiceMultipleAnswer
                   ? `1. Mark Options (${aiAnswer.selected_option_id})`
                   : `1. Mark Option (${aiAnswer.selected_option_id})`}
               </button>

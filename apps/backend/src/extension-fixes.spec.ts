@@ -151,9 +151,48 @@ describe('Extension fixes', () => {
     expect(extractor.hasQuestionMark('Which one is FIFO?')).toBe(true);
   });
 
+  it('detects an "Enter your answer" question and types the answer into it', () => {
+    document.body.innerHTML = `
+      <main>
+        <p>In a range query, if <code>prefix = [3, 8, 12, 20]</code>, what is the sum from index <code>1</code> to <code>3</code> ?</p>
+        <hr/>
+        <textarea placeholder="Enter your answer"></textarea>
+        <button>SHOW ANSWER</button><button>SUBMIT</button><button>SKIP</button>
+      </main>`;
+    const qs = extractor.extractAllQuestions();
+    expect(qs).toHaveLength(1);
+    expect(qs[0].questionType).toBe('DESCRIPTIVE');
+    expect(qs[0].options).toEqual([]);
+    expect(qs[0].questionText).toContain('prefix = [3, 8, 12, 20]');
+
+    let seen = '';
+    document.querySelector('textarea')!.addEventListener('input', (e) => (seen = (e.target as HTMLTextAreaElement).value));
+    const res = interaction.fillTextAnswer(qs[0].inputSelector, '17');
+    expect(res.success).toBe(true);
+    expect(seen).toBe('17'); // the page's input listener saw the typed value
+  });
+
+  it('ignores search boxes and multi-field forms as typed-answer questions', () => {
+    document.body.innerHTML = `<header><input type="text" placeholder="Search courses"></header><p>Welcome back to your dashboard!</p>`;
+    expect(extractor.extractAllQuestions()).toHaveLength(0);
+    document.body.innerHTML = `<form><p>Contact us about anything?</p><input type="text"><input type="text"><button>SUBMIT</button></form>`;
+    expect(extractor.extractAllQuestions()).toHaveLength(0);
+  });
+
   it('detects sequence wording like "set the following options in sequence"', () => {
     expect(extractor.isOrderingPrompt('Set the following options in sequence')).toBe(true);
     expect(extractor.isOrderingPrompt('Arrange the steps in the correct order')).toBe(true);
     expect(extractor.isOrderingPrompt('What is the time complexity of binary search?')).toBe(false);
+    // the course instructions page from the live run
+    expect(extractor.isOrderingPrompt('You must answer all the MCQs correctly in order to mark your practice as completed.')).toBe(false);
+  });
+
+  it('does not turn an instructions list into a drag-and-drop question', () => {
+    document.body.innerHTML = `
+      <main><h3>Instructions</h3>
+        <p>You must answer all the MCQs correctly in order to mark your practice as completed.</p>
+        <ul><li>Number of Questions: 15</li><li>Assessment Name: MCQ Practice</li><li>Marking Scheme: All questions have equal weightage</li></ul>
+        <button>Start Practice</button></main>`;
+    expect(extractor.extractAllQuestions()).toHaveLength(0);
   });
 });

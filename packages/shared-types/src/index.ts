@@ -217,12 +217,13 @@ export const SolveQuestionPayloadSchema = z.object({
   pageTitle: z.string().optional(),
   enableWebSearch: z.boolean().optional(),
   question: z.string().min(1),
+  // Empty for typed-answer questions (questionType 'DESCRIPTIVE')
   options: z.array(
     z.object({
       id: z.string().min(1),
       text: z.string(),
     }),
-  ).min(1),
+  ),
   questionFingerprint: z.string().min(1),
   questionNumber: z.number().optional(),
   forceFresh: z.boolean().optional(),
@@ -231,6 +232,9 @@ export const SolveQuestionPayloadSchema = z.object({
   isOrderingQuestion: z.boolean().optional(),
   questionType: z.enum(['SINGLE_CHOICE', 'MULTIPLE_CHOICE', 'ORDERING', 'CODING', 'DESCRIPTIVE']).optional(),
   images: z.array(QuestionImagePayloadSchema).max(8).optional(),
+}).refine((p) => p.options.length > 0 || p.questionType === 'DESCRIPTIVE', {
+  message: 'options are required unless questionType is DESCRIPTIVE (typed answer)',
+  path: ['options'],
 });
 
 export interface SolveQuestionResponse {

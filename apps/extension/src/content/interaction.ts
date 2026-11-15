@@ -307,6 +307,47 @@ export class DOMInteractionManager {
   }
 
   /**
+   * Types an answer into the question's text box so the page's framework sees it.
+   * Setting `.value` directly is invisible to React (same value-tracker issue as radios),
+   * so the prototype setter is used and input/change events are fired like real typing.
+   */
+  public fillTextAnswer(inputSelector: string | undefined, answer: string): { success: boolean; message: string } {
+    let box: HTMLInputElement | HTMLTextAreaElement | null = null;
+    if (inputSelector) {
+      try {
+        box = document.querySelector<HTMLInputElement | HTMLTextAreaElement>(inputSelector);
+      } catch {
+        box = null;
+      }
+    }
+    if (!box || !isRendered(box)) {
+      box = document.querySelector<HTMLTextAreaElement>('textarea:not([readonly]):not([disabled])');
+    }
+    if (!box) return { success: false, message: 'Could not find the answer box on the page.' };
+
+    box.scrollIntoView?.({ block: 'center' });
+    box.focus();
+    const proto = box instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+    if (setter) setter.call(box, answer);
+    else box.value = answer;
+    box.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: answer }));
+    box.dispatchEvent(new Event('change', { bubbles: true }));
+    box.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: answer.slice(-1) || 'a' }));
+    box.blur();
+
+    const ok = box.value === answer;
+    return {
+      success: ok,
+      message: ok
+        ? `Typed answer: "${answer.slice(0, 60)}"`
+        : box instanceof HTMLInputElement && box.type === 'number'
+          ? `The box only accepts numbers; the answer "${answer.slice(0, 40)}" was rejected.`
+          : 'The page did not accept the typed answer.',
+    };
+  }
+
+  /**
    * Resolves the selector saved during extraction, only if it is unambiguous,
    * rendered, and (when option text is known) still labelled with that text.
    */

@@ -6,6 +6,34 @@ import { AIAnswerResult, AIAnswerResultSchema, QuestionType, QuestionImagePayloa
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Seconds Gemini asks us to wait on a 429, if it says. */
+/** Milliseconds until the next midnight in US Pacific time (when Gemini daily quotas reset). */
+export function msUntilPacificMidnight(now = new Date()): number {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Los_Angeles',
+    hour: 'numeric',
+    minute: 'numeric',
+    second: 'numeric',
+    hourCycle: 'h23',
+  }).formatToParts(now);
+  const get = (t: string) => Number(parts.find((x) => x.type === t)?.value || 0);
+  const elapsed = (get('hour') * 3600 + get('minute') * 60 + get('second')) * 1000;
+  return Math.max(60000, 24 * 3600 * 1000 - elapsed);
+}
+
+/**
+ * What to type into an answer box: the bare answer, without wrapping quotes/backticks,
+ * "Answer:" prefixes or a trailing full stop on short answers.
+ */
+export function cleanTypedAnswer(raw: string): string {
+  let t = String(raw || '').trim();
+  t = t.replace(/^(final\s+)?answer\s*[:=-]\s*/i, '');
+  const fenced = t.match(/^```[a-z]*\n?([\s\S]*?)\n?```$/i);
+  if (fenced) t = fenced[1].trim();
+  if (/^(["'`])[\s\S]*\1$/.test(t) && t.length >= 2) t = t.slice(1, -1).trim();
+  if (!t.includes('\n') && t.length <= 40) t = t.replace(/\.$/, '');
+  return t;
+}
+
 export function parseRetryDelayMs(message: string): number | null {
   const m = message.match(/retry(?:Delay)?["':\s]*(?:in\s*)?"?(\d+(?:\.\d+)?)\s*s/i);
   return m ? Math.ceil(parseFloat(m[1]) * 1000) : null;
@@ -48,10 +76,36 @@ export class GeminiProvider implements AIProvider {
   }
   private readonly availableModels = [
     'gemini-3.5-flash-lite',
+    'gemini-flash-lite-latest',
     'gemini-3.1-flash-lite',
     'gemini-3.6-flash',
     'gemini-3.8-flash',
+    'gemma-4-26b-a4b-it',
   ];
+
+  /**
+   * Models tried in order when the chosen one is rate limited. Each model has its OWN free
+   * quota, so rotating through them keeps a long practice set going. Gemma is slower but has a
+   * separate quota and is the last resort.
+   */
+  static readonly FALLBACK_MODELS = [
+    'gemini-3.5-flash-lite',
+    'gemini-3.1-flash-lite',
+    'gemini-3.6-flash',
+    'gemini-3.8-flash',
+    'gemma-4-26b-a4b-it',
+  ];
+
+  /** Model -> time (ms) until which it is rate limited. Skipped until then, no waiting. */
+  private readonly cooldownUntil = new Map<string, number>();
+
+  /** Rate-limit state per model, for logs and the health endpoint. */
+  getCooldowns(): { model: string; secondsLeft: number }[] {
+    const now = Date.now();
+    return Array.from(this.cooldownUntil.entries())
+      .filter(([, until]) => until > now)
+      .map(([model, until]) => ({ model, secondsLeft: Math.ceil((until - now) / 1000) }));
+  }
 
   getAvailableModels(): string[] {
     return this.availableModels;
@@ -172,13 +226,44 @@ export class GeminiProvider implements AIProvider {
     const genAI = new GoogleGenerativeAI(apiKey);
     const isMultiAnswer = optionsMetadata?.isMultipleChoiceMultipleAnswer ?? false;
     const isOrdering = Boolean(optionsMetadata?.isOrderingQuestion || optionsMetadata?.questionType === 'ORDERING');
+    // Typed answer ("Enter your answer" box): no options to pick from
+    const isText = !isOrdering && (optionsMetadata?.questionType === 'DESCRIPTIVE' || options.length === 0);
 
     const requestedModel = modelOverride || GeminiProvider.DEFAULT_MODEL;
-    const fallbackList = [GeminiProvider.DEFAULT_MODEL, 'gemini-3.1-flash-lite', 'gemini-3.6-flash'];
-    const modelsToTry = [requestedModel, ...fallbackList.filter((m) => m !== requestedModel)];
+    const allModels = [requestedModel, ...GeminiProvider.FALLBACK_MODELS.filter((m) => m !== requestedModel)];
+    // Skip models that are rate limited right now instead of waiting on them
+    const now = Date.now();
+    const modelsToTry = allModels.filter((m) => (this.cooldownUntil.get(m) || 0) <= now);
+    if (modelsToTry.length === 0) {
+      const soonest = Math.min(...allModels.map((m) => this.cooldownUntil.get(m) || now));
+      const secs = Math.max(1, Math.ceil((soonest - now) / 1000));
+      throw new Error(`429 All Gemini models are rate limited. Please retry in ${secs}s.`);
+    }
 
     let systemPrompt = '';
-    if (isOrdering) {
+    if (isText) {
+      systemPrompt = `You are an expert academic tutor solving a TYPED-ANSWER question.
+There are no options: the student must type the answer into a text box, and the portal compares it with the expected answer.
+
+STRICT INSTRUCTIONS:
+1. Work the problem out carefully step by step in "reasoning" (show calculations).
+2. "answer_text" must contain ONLY what should be typed into the box: the shortest exact answer
+   (a number, word, short phrase, expression, or code snippet). No explanation, no units unless the
+   question asks for them, no "Answer:" prefix, no surrounding quotes, no trailing full stop.
+3. Match the format the question implies (e.g. an integer stays "17", not "17.0"; keep list/array
+   formatting like [1, 2, 3] if a list is asked for; keep exact casing for code/keywords).
+4. Set "selected_option_id" to "TEXT".
+5. If the question is ambiguous or you are unsure, still give your best answer and set "needs_review": true.
+6. Output ONLY a raw JSON object (no markdown, no code fences):
+{
+  "selected_option_id": "TEXT",
+  "answer_text": "17",
+  "explanation": "One or two sentences on why.",
+  "confidence": 0.95,
+  "needs_review": false,
+  "reasoning": "Step-by-step working"
+}`;
+    } else if (isOrdering) {
       systemPrompt = `You are an expert academic tutor and AI ordering/sequencing solver.
 IMPORTANT: This is a REARRANGE / DRAG-AND-DROP ORDERING QUESTION.
 The user must arrange the given items/steps into the correct chronological, logical, or procedural sequence from first step (beginning) to last step (end).
@@ -308,11 +393,13 @@ STRICT INSTRUCTIONS:
     const userContent = JSON.stringify({
       question,
       options,
-      questionType: isMultiAnswer ? 'MULTIPLE_CHOICE_MULTIPLE_ANSWER' : 'SINGLE_CHOICE',
+      questionType: isText ? 'TYPED_ANSWER' : isMultiAnswer ? 'MULTIPLE_CHOICE_MULTIPLE_ANSWER' : 'SINGLE_CHOICE',
     });
 
     let lastError: Error | null = null;
-    const timeoutMs = imageList.length > 0 ? 60000 : 40000;
+    // Flash-Lite answers text in ~1-3s. Waiting 40s on an overloaded model only stalls the
+    // loop; give up sooner and let the next model answer.
+    const timeoutMs = imageList.length > 0 ? 45000 : 20000;
     const parts: any[] = [
       { text: userContent },
       ...imageList.map((img) => ({ inlineData: { mimeType: img.mimeType, data: img.data } })),
@@ -322,7 +409,6 @@ STRICT INSTRUCTIONS:
       let attempts = 0;
       const maxAttempts = 2;
       let delay = 800;
-      let waitedForQuota = false;
 
       while (attempts < maxAttempts) {
         attempts++;
@@ -377,11 +463,11 @@ STRICT INSTRUCTIONS:
 
           // Validate structure with Zod
           const validated = AIAnswerResultSchema.parse({
-            selected_option_id: String(
+            selected_option_id: isText ? 'TEXT' : String(
               parsed.selected_option_id ||
                 (orderedSeq ? orderedSeq.join(', ') : selectedIds ? selectedIds.join(', ') : ''),
             ),
-            selected_option_ids: selectedIds,
+            selected_option_ids: isText ? undefined : selectedIds,
             ordered_sequence: orderedSeq,
             answer_text: String(
               parsed.answer_text ||
@@ -405,7 +491,10 @@ STRICT INSTRUCTIONS:
           const validOptionIds = options.map((o) => o.id);
           const normAns = validated.answer_text.trim().toLowerCase();
 
-          if (isOrdering) {
+          if (isText) {
+            validated.answer_text = cleanTypedAnswer(validated.answer_text);
+            if (!validated.answer_text) throw new Error('Empty typed answer from model');
+          } else if (isOrdering) {
             if (orderedSeq && orderedSeq.length > 0) {
               const invalidIds = orderedSeq.filter((id) => !validOptionIds.includes(id));
               if (invalidIds.length > 0) {
@@ -463,20 +552,32 @@ STRICT INSTRUCTIONS:
 
           this.logger.warn(`Model ${currentModelName} attempt ${attempts} error: ${msg}`);
 
-          // Per-minute limit: if Gemini says to wait a short while, wait once on this model
-          // instead of burning through every fallback model in a second.
-          if (isRateLimited && !waitedForQuota) {
-            const retryMs = parseRetryDelayMs(msg);
-            if (retryMs !== null && retryMs <= 30000) {
-              waitedForQuota = true;
-              this.logger.warn(`Rate limited on ${currentModelName}. Waiting ${Math.round(retryMs / 1000)}s as Gemini asked.`);
-              await sleep(retryMs + 500);
-              attempts--; // the wait is not a failed attempt
-              continue;
-            }
+          // Rate limited: park this model until its quota frees up and move on to the next
+          // model immediately (each model has its own quota). A daily limit parks it until
+          // midnight Pacific; a per-minute limit for as long as Gemini asks (default 60s).
+          if (isRateLimited) {
+            const daily = /per.?day|perday|daily/i.test(msg);
+            const waitMs = daily ? msUntilPacificMidnight() : (parseRetryDelayMs(msg) ?? 60000) + 1000;
+            this.cooldownUntil.set(currentModelName, Date.now() + waitMs);
+            this.logger.warn(
+              `${currentModelName} rate limited (${daily ? 'daily quota' : 'per-minute'}). Skipping it for ${Math.round(waitMs / 1000)}s.`,
+            );
+            break;
+          }
+          // Overloaded (503 "high demand") or too slow: park it for 2 minutes, use the next model
+          const isOverloaded = /503|overloaded|high demand|service unavailable|timed out/i.test(msg);
+          if (isOverloaded) {
+            this.cooldownUntil.set(currentModelName, Date.now() + 120000);
+            this.logger.warn(`${currentModelName} overloaded/slow. Skipping it for 120s.`);
+            break;
           }
 
-          if (isRateLimited || isUnavailable) {
+          if (isUnavailable) {
+            // Retired or not enabled for this key: never try it again this run
+            this.cooldownUntil.set(currentModelName, Date.now() + 24 * 3600 * 1000);
+          }
+
+          if (isUnavailable) {
             this.logger.warn(
               `Quota/availability issue on ${currentModelName}. Switching to fallback model...`,
             );
@@ -491,6 +592,13 @@ STRICT INSTRUCTIONS:
       }
     }
 
+    // Everything we tried was rate limited: say when the first model frees up again
+    const after = Date.now();
+    const parked = allModels.map((m) => this.cooldownUntil.get(m) || 0).filter((t) => t > after);
+    if (parked.length === allModels.length) {
+      const secs = Math.max(1, Math.ceil((Math.min(...parked) - after) / 1000));
+      throw new Error(`429 All Gemini models are rate limited. Please retry in ${secs}s.`);
+    }
     throw new Error(
       `Failed to generate answer across all available models: ${lastError?.message || 'Unknown error'}`,
     );

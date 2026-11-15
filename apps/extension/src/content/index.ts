@@ -152,8 +152,19 @@ function initContentScript(): void {
         return true;
       }
 
+      case 'FILL_TEXT_ANSWER' as any: {
+        const { inputSelector, answer } = (message as any).payload || {};
+        sendResponse(interaction.fillTextAnswer(inputSelector, String(answer || '')));
+        return false;
+      }
+
       case 'CONFIRM_SELECTION': {
         const payload = message.payload as any;
+        if (payload.optionId === 'TEXT') {
+          // Typed-answer question: elementSelector is the answer box, optionText the answer
+          sendResponse(interaction.fillTextAnswer(payload.elementSelector, String(payload.optionText || '')));
+          return false;
+        }
         if (Array.isArray(payload.optionIds) && payload.optionIds.length > 0) {
           sendResponse(interaction.selectMultipleOptions(payload.optionIds, payload.options || []));
         } else {
@@ -265,7 +276,9 @@ function initContentScript(): void {
   const attempts = new Map<string, number>();
 
   const MAX_FAILURES = 4;
-  const MAX_BUSY_RETRIES = 8;
+  // Rate limits are waited out, not treated as failures. 40 waits of up to 2 min each
+  // covers a per-minute limit many times over; only a fully used daily quota stops the loop.
+  const MAX_BUSY_RETRIES = 40;
   const MAX_ATTEMPTS_PER_QUESTION = 4;
   const MIN_AUTO_CONFIDENCE = 0.6;
   // Background tabs: Chrome slows the portal's own timers, so its next question can take much
@@ -443,12 +456,15 @@ function initContentScript(): void {
         }
         if (BUSY_ERROR.test(reason)) {
           busyRetries++;
-          if (busyRetries > MAX_BUSY_RETRIES) {
-            finish(`⏸️ Gemini is still rate limited after ${MAX_BUSY_RETRIES} retries. Wait a few minutes or switch model. (${reason.slice(0, 120)})`);
+          const askedSecs = Number((reason.match(/retry in (\d+(?:\.\d+)?)\s*s/i) || [])[1]);
+          // Every model out of daily quota: waiting hours is pointless, stop and say so
+          if (askedSecs > 1800 || busyRetries > MAX_BUSY_RETRIES) {
+            const hours = askedSecs > 1800 ? ` Quota resets in about ${Math.ceil(askedSecs / 3600)}h (midnight US Pacific).` : '';
+            finish(`⏸️ Every Gemini model is out of free quota.${hours} Enable billing in Google AI Studio for higher limits.`);
             return;
           }
-          const wait = Math.min(60000, 4000 * 2 ** (busyRetries - 1));
-          loopStatus = `Gemini busy / rate limited. Retry ${busyRetries}/${MAX_BUSY_RETRIES} in ${Math.round(wait / 1000)}s...`;
+          const wait = askedSecs > 0 ? Math.min(120000, askedSecs * 1000 + 1000) : Math.min(60000, 4000 * 2 ** (busyRetries - 1));
+          loopStatus = `⏳ Gemini rate limit: waiting ${Math.round(wait / 1000)}s, then continuing automatically...`;
           scheduleCycle(run, wait);
           return;
         }
@@ -520,6 +536,34 @@ function initContentScript(): void {
       // they are counted and reported when the loop finishes.
       const confidence = typeof answer.confidence === 'number' ? answer.confidence : 0;
       if (answer.needs_review || confidence < MIN_AUTO_CONFIDENCE) lowConfidence++;
+
+      // Typed answer: type it into the box, then submit and move on like any other question
+      if (q.questionType === 'DESCRIPTIVE' && q.options.length === 0) {
+        const typed = String(answer.answer_text || '').trim();
+        const fill = interaction.fillTextAnswer(q.inputSelector, typed);
+        if (!fill.success) {
+          finish(`⏸️ ${fill.message} Type "${typed.slice(0, 60)}" manually, then restart.`);
+          return;
+        }
+        submitted.add(q.fingerprint);
+        solvedCount++;
+        loopStatus = `2. Typed "${typed.slice(0, 40)}". Submitting...`;
+        await sleep(500);
+        if (!alive()) return;
+        const nearBox = extractor.getQuestionMedia(q.fingerprint)?.region;
+        const submitTyped = await interaction.clickSubmitButton(6000, nearBox);
+        await sleep(700);
+        if (!alive()) return;
+        loopStatus = '3. Clicking Next question...';
+        const nextTyped = await interaction.waitForAndClickNextButton(10000, nearBox);
+        if (!alive()) return;
+        if (!submitTyped.success && !nextTyped.success) {
+          finish(`✅ Typed the answer. No Submit or Next button found, so nothing was submitted.`);
+          return;
+        }
+        scheduleCycle(run, 1200);
+        return;
+      }
 
       // Match and select
       let matchedIdStr = '';
