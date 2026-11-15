@@ -1,0 +1,21 @@
+{
+  "name": "ai-mcq-assistant",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "build:shared": "npm run build --workspace=@ai-mcq/shared-types",
+    "build:backend": "npm run build --workspace=@ai-mcq/backend",
+    "build:extension": "npm run build --workspace=@ai-mcq/extension",
+    "start:backend": "npm run start:dev --workspace=@ai-mcq/backend",
+    "test": "npm run test --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5"
+  }
+}

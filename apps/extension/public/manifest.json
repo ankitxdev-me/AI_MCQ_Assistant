@@ -1,0 +1,52 @@
+{
+  "manifest_version": 3,
+  "name": "AI MCQ Assistant",
+  "version": "1.0.0",
+  "description": "Local AI MCQ Assistant with DOM question extraction and structured Gemini reasoning.",
+  "permissions": [
+    "activeTab",
+    "storage",
+    "sidePanel",
+    "scripting",
+    "tabs"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:3000/*",
+    "http://localhost:3000/*",
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "AI MCQ Assistant"
+  },
+  "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+Y",
+        "mac": "Command+Shift+Y"
+      },
+      "description": "Open AI MCQ Assistant popup"
+    },
+    "open-standalone-window": {
+      "suggested_key": {
+        "default": "Alt+Shift+M",
+        "mac": "Alt+Shift+M"
+      },
+      "description": "Open AI MCQ Assistant in separate window"
+    }
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  }
+}
+

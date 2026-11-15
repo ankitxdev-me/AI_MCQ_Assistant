@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Local MCQ Practice Test Portal</title>
+  <style>
+    :root {
+      --primary: #2563eb;
+      --bg: #f8fafc;
+      --card-bg: #ffffff;
+      --text: #0f172a;
+      --border: #e2e8f0;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      margin: 0;
+      padding: 40px 20px;
+    }
+    .container {
+      max-width: 800px;
+      margin: 0 auto;
+    }
+    header {
+      margin-bottom: 30px;
+      border-bottom: 2px solid var(--border);
+      padding-bottom: 20px;
+    }
+    h1 {
+      font-size: 24px;
+      margin: 0 0 8px 0;
+      color: #1e293b;
+    }
+    p.subtitle {
+      color: #64748b;
+      margin: 0;
+      font-size: 14px;
+    }
+    .section-title {
+      font-size: 18px;
+      font-weight: 700;
+      color: #334155;
+      margin: 30px 0 16px 0;
+      padding-left: 8px;
+      border-left: 4px solid var(--primary);
+    }
+    .question-card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 24px;
+      margin-bottom: 24px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    }
+    .question-title {
+      font-weight: 600;
+      font-size: 16px;
+      margin-bottom: 16px;
+      color: #1e293b;
+    }
+    .options-group {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    label.option-label {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 14px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      cursor: pointer;
+      transition: all 0.2s;
+      background: #fafafa;
+    }
+    label.option-label:hover {
+      background: #eff6ff;
+      border-color: #93c5fd;
+    }
+    input[type="radio"] {
+      margin: 0;
+      cursor: pointer;
+    }
+    .wizard-controls {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: 20px;
+      padding-top: 16px;
+      border-top: 1px solid var(--border);
+    }
+    button.btn {
+      background: var(--primary);
+      color: white;
+      border: none;
+      padding: 10px 20px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: 500;
+      font-size: 14px;
+      transition: background 0.2s;
+    }
+    button.btn:hover {
+      background: #1d4ed8;
+    }
+    button.btn:disabled {
+      background: #cbd5e1;
+      cursor: not-allowed;
+    }
+    /* ARIA custom radio styles */
+    [role="radiogroup"] {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    [role="radio"] {
+      display: flex;
+      align-items: center;
+      padding: 10px 14px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      cursor: pointer;
+      background: #fafafa;
+    }
+    [role="radio"][aria-checked="true"] {
+      background: #eff6ff;
+      border-color: var(--primary);
+      font-weight: 600;
+    }
+    [role="radio"]::before {
+      content: '';
+      display: inline-block;
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      border: 2px solid #94a3b8;
+      margin-right: 12px;
+    }
+    [role="radio"][aria-checked="true"]::before {
+      background: var(--primary);
+      border-color: var(--primary);
+      box-shadow: inset 0 0 0 2px white;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>AI MCQ Assistant Verification & Test Suite</h1>
+      <p class="subtitle">10 comprehensive MCQs featuring standard forms, label associations, custom ARIA radiogroups, stepper navigation, dynamic questions, and ambiguous items.</p>
+    </header>
+
+    <!-- SECTION 1: Standard Multiple-Question Layout -->
+    <div class="section-title">Section A: Standard Form & Label-Associated Questions</div>
+
+    <!-- Question 1: Standard radio buttons wrapped in labels -->
+    <div class="question-card" data-question-id="q1">
+      <div class="question-title">Question 1: Which data structure operates on a First-In, First-Out (FIFO) basis?</div>
+      <div class="options-group">
+        <label class="option-label"><input type="radio" name="q1" value="A"> A) Stack</label>
+        <label class="option-label"><input type="radio" name="q1" value="B"> B) Queue</label>
+        <label class="option-label"><input type="radio" name="q1" value="C"> C) Binary Search Tree</label>
+        <label class="option-label"><input type="radio" name="q1" value="D"> D) Hash Map</label>
+      </div>
+    </div>
+
+    <!-- Question 2: Label-based with explicit for/id linking -->
+    <div class="question-card" data-question-id="q2">
+      <div class="question-title">Question 2: What is the primary purpose of the DNS (Domain Name System)?</div>
+      <div class="options-group">
+        <label class="option-label" for="q2_a">
+          <input type="radio" id="q2_a" name="q2_group" value="A">
+          A) Translates domain names to IP addresses
+        </label>
+        <label class="option-label" for="q2_b">
+          <input type="radio" id="q2_b" name="q2_group" value="B">
+          B) Encrypts HTTP packets in transit
+        </label>
+        <label class="option-label" for="q2_c">
+          <input type="radio" id="q2_c" name="q2_group" value="C">
+          C) Distributes electricity across physical server racks
+        </label>
+        <label class="option-label" for="q2_d">
+          <input type="radio" id="q2_d" name="q2_group" value="D">
+          D) Compiles JavaScript into machine assembly code
+        </label>
+      </div>
+    </div>
+
+    <!-- Question 3: Fieldset and Legend structure -->
+    <div class="question-card">
+      <fieldset style="border: none; margin: 0; padding: 0;">
+        <legend class="question-title">Question 3: In relational databases, what does the ACID acronym stand for?</legend>
+        <div class="options-group">
+          <label class="option-label"><input type="radio" name="q3" value="A"> A) Atomicity, Consistency, Isolation, Durability</label>
+          <label class="option-label"><input type="radio" name="q3" value="B"> B) Accuracy, Concurrency, Indexing, Delivery</label>
+          <label class="option-label"><input type="radio" name="q3" value="C"> C) Automated, Centralized, Integrated, Distributed</label>
+          <label class="option-label"><input type="radio" name="q3" value="D"> D) Access, Control, Identity, Delegation</label>
+        </div>
+      </fieldset>
+    </div>
+
+    <!-- Question 4: ARIA Accessible Radiogroup -->
+    <div class="section-title">Section B: Accessible Custom ARIA Controls</div>
+    <div class="question-card">
+      <div class="question-title">Question 4: What is the average time complexity of searching in a balanced Binary Search Tree?</div>
+      <div role="radiogroup" aria-label="Question 4: What is the average time complexity of searching in a balanced Binary Search Tree?">
+        <div role="radio" tabindex="0" aria-checked="false" aria-label="O(1)">A) O(1)</div>
+        <div role="radio" tabindex="0" aria-checked="false" aria-label="O(log n)">B) O(log n)</div>
+        <div role="radio" tabindex="0" aria-checked="false" aria-label="O(n)">C) O(n)</div>
+        <div role="radio" tabindex="0" aria-checked="false" aria-label="O(n^2)">D) O(n^2)</div>
+      </div>
+    </div>
+
+    <!-- SECTION 3: One-Question-At-A-Time Stepper Wizard -->
+    <div class="section-title">Section C: Single-Question Stepper Wizard (Questions 5-8)</div>
+    <div class="question-card" id="stepper-container">
+      <!-- Wizard Step 1: Question 5 -->
+      <div class="wizard-step" id="step-1">
+        <div class="question-title">Question 5: Which HTTP status code represents "Internal Server Error"?</div>
+        <div class="options-group">
+          <label class="option-label"><input type="radio" name="q5" value="A"> A) 200 OK</label>
+          <label class="option-label"><input type="radio" name="q5" value="B"> B) 400 Bad Request</label>
+          <label class="option-label"><input type="radio" name="q5" value="C"> C) 404 Not Found</label>
+          <label class="option-label"><input type="radio" name="q5" value="D"> D) 500 Internal Server Error</label>
+        </div>
+      </div>
+
+      <!-- Wizard Step 2: Question 6 (Hidden initially) -->
+      <div class="wizard-step" id="step-2" style="display: none;">
+        <div class="question-title">Question 6: In JavaScript, what will `typeof NaN` evaluate to?</div>
+        <div class="options-group">
+          <label class="option-label"><input type="radio" name="q6" value="A"> A) "undefined"</label>
+          <label class="option-label"><input type="radio" name="q6" value="B"> B) "number"</label>
+          <label class="option-label"><input type="radio" name="q6" value="C"> C) "NaN"</label>
+          <label class="option-label"><input type="radio" name="q6" value="D"> D) "object"</label>
+        </div>
+      </div>
+
+      <!-- Wizard Step 3: Question 7 (Hidden initially) -->
+      <div class="wizard-step" id="step-3" style="display: none;">
+        <div class="question-title">Question 7: Which protocol is connection-oriented and provides reliable stream transmission?</div>
+        <div class="options-group">
+          <label class="option-label"><input type="radio" name="q7" value="A"> A) UDP</label>
+          <label class="option-label"><input type="radio" name="q7" value="B"> B) TCP</label>
+          <label class="option-label"><input type="radio" name="q7" value="C"> C) ICMP</label>
+          <label class="option-label"><input type="radio" name="q7" value="D"> D) ARP</label>
+        </div>
+      </div>
+
+      <!-- Wizard Step 4: Question 8 (Hidden initially) -->
+      <div class="wizard-step" id="step-4" style="display: none;">
+        <div class="question-title">Question 8: In Git, which command creates a new branch and switches to it in one step?</div>
+        <div class="options-group">
+          <label class="option-label"><input type="radio" name="q8" value="A"> A) git branch -d new-branch</label>
+          <label class="option-label"><input type="radio" name="q8" value="B"> B) git checkout -b new-branch</label>
+          <label class="option-label"><input type="radio" name="q8" value="C"> C) git merge -b new-branch</label>
+          <label class="option-label"><input type="radio" name="q8" value="D"> D) git rebase -new-branch</label>
+        </div>
+      </div>
+
+      <div class="wizard-controls">
+        <button type="button" class="btn" id="prev-btn" onclick="prevStep()" disabled>&larr; Previous</button>
+        <span id="step-indicator" style="font-size: 13px; color: #64748b; font-weight: 500;">Step 1 of 4 (Question 5)</span>
+        <button type="button" class="btn" id="next-btn" onclick="nextStep()">Next Question &rarr;</button>
+      </div>
+    </div>
+
+    <!-- SECTION 4: Dynamically Injected Question -->
+    <div class="section-title">Section D: Dynamically Injected Question (MutationObserver Test)</div>
+    <div class="question-card" id="dynamic-container">
+      <div id="dynamic-placeholder">
+        <p style="font-size: 14px; color: #64748b; margin-bottom: 12px;">Click the button below to dynamically inject Question 9 into the DOM via JavaScript.</p>
+        <button type="button" class="btn" id="inject-btn" onclick="injectDynamicQuestion()">Inject Question 9</button>
+      </div>
+    </div>
+
+    <!-- SECTION 5: Intentionally Ambiguous Question -->
+    <div class="section-title">Section E: Intentionally Ambiguous Question (Review Trigger)</div>
+    <div class="question-card" data-question-id="q10">
+      <div class="question-title">Question 10: Which programming language is the objectively best language for writing all computer software?</div>
+      <div class="options-group">
+        <label class="option-label"><input type="radio" name="q10" value="A"> A) Python</label>
+        <label class="option-label"><input type="radio" name="q10" value="B"> B) Rust</label>
+        <label class="option-label"><input type="radio" name="q10" value="C"> C) C++</label>
+        <label class="option-label"><input type="radio" name="q10" value="D"> D) No single language is objectively best; choice depends on domain and trade-offs</label>
+      </div>
+    </div>
+
+    <!-- SECTION 6: Drag and Drop Ordering Question (CCBP Multiprogramming Scenario) -->
+    <div class="section-title">Section F: Drag-and-Drop Step Ordering Question</div>
+    <div class="question-card" id="ordering-question-container">
+      <div class="question-title">Rearrange the following steps to describe how a multiprogramming operating system improves CPU utilization by switching between I/O and CPU tasks:</div>
+      <div style="font-size: 13px; color: #64748b; margin: 8px 0 16px 0; font-weight: 500;">Drag and Drop to Order</div>
+      <div id="dnd-droppable-list" data-rbd-droppable-id="steps-list" style="display: flex; flex-direction: column; gap: 10px;">
+        <div class="dnd-item" data-rbd-draggable-id="item-1" draggable="true" style="display: flex; align-items: center; gap: 12px; padding: 12px 16px; background: #ffffff; border: 1px solid #cbd5e1; border-radius: 8px; cursor: grab;">
+          <span style="font-weight: 600; color: #475569;">1</span>
+          <span data-rbd-drag-handle-draggable-id="handle-1" style="cursor: grab; color: #94a3b8; user-select: none;">&#8942;&#8942;</span>
+          <span style="font-size: 14px; color: #1e293b;">Continue switching between programs whenever one performs an I/O operation.</span>
+        </div>
+        <div class="dnd-item" data-rbd-draggable-id="item-2" draggable="true" style="display: flex; align-items: center; gap: 12px; padding: 12px 16px; background: #ffffff; border: 1px solid #cbd5e1; border-radius: 8px; cursor: grab;">
+          <span style="font-weight: 600; color: #475569;">2</span>
+          <span data-rbd-drag-handle-draggable-id="handle-2" style="cursor: grab; color: #94a3b8; user-select: none;">&#8942;&#8942;</span>
+          <span style="font-size: 14px; color: #1e293b;">When the first program performs an I/O operation, switch to the next program.</span>
+        </div>
+        <div class="dnd-item" data-rbd-draggable-id="item-3" draggable="true" style="display: flex; align-items: center; gap: 12px; padding: 12px 16px; background: #ffffff; border: 1px solid #cbd5e1; border-radius: 8px; cursor: grab;">
+          <span style="font-weight: 600; color: #475569;">3</span>
+          <span data-rbd-drag-handle-draggable-id="handle-3" style="cursor: grab; color: #94a3b8; user-select: none;">&#8942;&#8942;</span>
+          <span style="font-size: 14px; color: #1e293b;">Start executing the first program on the CPU.</span>
+        </div>
+        <div class="dnd-item" data-rbd-draggable-id="item-4" draggable="true" style="display: flex; align-items: center; gap: 12px; padding: 12px 16px; background: #ffffff; border: 1px solid #cbd5e1; border-radius: 8px; cursor: grab;">
+          <span style="font-weight: 600; color: #475569;">4</span>
+          <span data-rbd-drag-handle-draggable-id="handle-4" style="cursor: grab; color: #94a3b8; user-select: none;">&#8942;&#8942;</span>
+          <span style="font-size: 14px; color: #1e293b;">Load multiple programs into memory.</span>
+        </div>
+      </div>
+      <div style="display: flex; gap: 12px; margin-top: 20px;">
+        <button type="button" class="btn" style="background: #3b82f6;" onclick="submitOrder()">SUBMIT</button>
+        <button type="button" class="btn" style="background: #94a3b8;" onclick="alert('Showing answer')">SHOW ANSWER</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ARIA Radio Interaction
+    document.querySelectorAll('[role="radio"]').forEach(radio => {
+      radio.addEventListener('click', () => {
+        const group = radio.closest('[role="radiogroup"]');
+        group.querySelectorAll('[role="radio"]').forEach(r => r.setAttribute('aria-checked', 'false'));
+        radio.setAttribute('aria-checked', 'true');
+      });
+      radio.addEventListener('keydown', (e) => {
+        if (e.key === ' ' || e.key === 'Enter') {
+          radio.click();
+          e.preventDefault();
+        }
+      });
+    });
+
+    // Stepper Navigation
+    let currentStep = 1;
+    const totalSteps = 4;
+
+    function showStep(step) {
+      for (let i = 1; i <= totalSteps; i++) {
+        const el = document.getElementById('step-' + i);
+        if (el) el.style.display = i === step ? 'block' : 'none';
+      }
+      document.getElementById('prev-btn').disabled = step === 1;
+      document.getElementById('next-btn').disabled = step === totalSteps;
+      document.getElementById('step-indicator').textContent = 'Step ' + step + ' of ' + totalSteps + ' (Question ' + (step + 4) + ')';
+    }
+
+    function nextStep() {
+      if (currentStep < totalSteps) {
+        currentStep++;
+        showStep(currentStep);
+      }
+    }
+
+    function prevStep() {
+      if (currentStep > 1) {
+        currentStep--;
+        showStep(currentStep);
+      }
+    }
+
+    // Dynamic Injection for Question 9
+    function injectDynamicQuestion() {
+      const container = document.getElementById('dynamic-container');
+      container.innerHTML = `
+        <div class="question-title">Question 9: What is the primary role of the CSS flexbox "justify-content" property?</div>
+        <div class="options-group">
+          <label class="option-label"><input type="radio" name="q9" value="A"> A) Aligns flex items along the main axis</label>
+          <label class="option-label"><input type="radio" name="q9" value="B"> B) Aligns flex items along the cross axis</label>
+          <label class="option-label"><input type="radio" name="q9" value="C"> C) Sets the font weight of text</label>
+          <label class="option-label"><input type="radio" name="q9" value="D"> D) Defines the background gradient</label>
+        </div>
+      `;
+    }
+  </script>
+</body>
+</html>
+

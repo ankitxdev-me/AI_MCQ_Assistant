@@ -1,0 +1,14 @@
+node_modules/
+dist/
+build/
+.cache/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+apps/backend/data/*.db
+.env
+.env.*
+!.env.example
+coverage/
+
