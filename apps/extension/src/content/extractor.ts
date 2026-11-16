@@ -2,6 +2,8 @@ import { ExtractedQuestion, OptionItem } from '@ai-mcq/shared-types';
 import { createQuestionFingerprint } from './fingerprint';
 import { isRendered, isOptionRendered } from './visibility';
 import { collectQuestionContext, resolveOptionElement, nearbyQuestionText } from './media';
+import { expandToItemRows, hasItemText } from './dnd';
+import { isCodeBlock, findCodeBlocks, textWithoutCode, stripJunkChars } from './code';
 
 /** Prompt used when a question exists only as an image or figure. */
 export const VISUAL_PLACEHOLDER_PROMPT = 'Answer the question shown in the attached image or figure.';
@@ -1063,6 +1065,10 @@ export class DOMQuestionExtractor {
       }
     }
 
+    // Drag markers often sit only on the ⋮⋮ handle (no text). Use the whole row/card instead,
+    // otherwise every step reads as "Step N" and the order can't be solved or verified.
+    draggableElements = expandToItemRows(draggableElements);
+
     // Filter out buttons like SUBMIT, SHOW ANSWER, SKIP, and captions
     const filteredItems = draggableElements.filter((el) => {
       const lower = (el.textContent || '').trim().toLowerCase();
@@ -1078,6 +1084,8 @@ export class DOMQuestionExtractor {
     });
 
     if (filteredItems.length < 2) return null;
+    // Without readable step text there is nothing for the AI to order
+    if (filteredItems.filter((el) => hasItemText(el)).length < 2) return null;
 
     // 3. Build OptionItem array
     const options: OptionItem[] = [];
@@ -1319,7 +1327,8 @@ export class DOMQuestionExtractor {
     );
     for (const cand of Array.from(candidates)) {
       if (cand.querySelector('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]')) continue;
-      const text = this.cleanText(cand.textContent || '');
+      if (!this.isPromptCandidate(cand) || isCodeBlock(cand)) continue;
+      const text = this.cleanText(textWithoutCode(cand));
       if (this.hasQuestionMark(text) && text.length > 10 && !optionTexts.includes(text.toLowerCase())) {
         return text;
       }
@@ -1328,7 +1337,8 @@ export class DOMQuestionExtractor {
     // 2. Look at previous siblings of ancestor
     let prev = ancestor.previousElementSibling;
     while (prev) {
-      const text = this.cleanText(prev.textContent || '');
+      // leave code panels out of the prompt; they are added separately as [CODE]
+      const text = this.isPromptCandidate(prev) && !isCodeBlock(prev) ? this.cleanText(textWithoutCode(prev)) : '';
       if (text.length > 10 && !prev.querySelector('input') && !optionTexts.includes(text.toLowerCase())) {
         return text;
       }
@@ -1344,8 +1354,17 @@ export class DOMQuestionExtractor {
 
     // Code blocks, tables and figures are question context, never the prompt itself
     const CONTEXT_ONLY = 'pre, code, table, img, svg, canvas, .cm-editor, .CodeMirror, .monaco-editor, .ace_editor';
-    const isContextOnly = (el: Element) => el.matches(CONTEXT_ONLY) || (!!el.querySelector(CONTEXT_ONLY) && this.cleanText(el.textContent || '').length > 0 &&
-      Array.from(el.querySelectorAll(CONTEXT_ONLY)).reduce((n, c) => n + this.cleanText(c.textContent || '').length, 0) >= this.cleanText(el.textContent || '').length * 0.8);
+    const isContextOnly = (el: Element) =>
+      el.matches(CONTEXT_ONLY) ||
+      isCodeBlock(el) ||
+      // nothing but code/figures inside (e.g. a wrapper around a custom code panel)
+      (this.cleanText(el.textContent || '').length > 0 &&
+        this.cleanText(textWithoutCode(el)).length === 0) ||
+      (!!el.querySelector(CONTEXT_ONLY) &&
+        Array.from(el.querySelectorAll(CONTEXT_ONLY)).reduce((n, c) => n + this.cleanText(c.textContent || '').length, 0) >=
+          this.cleanText(el.textContent || '').length * 0.8);
+    // Prompt text of an element with any code panels inside it left out
+    const promptText = (el: Element) => this.cleanText(textWithoutCode(el));
 
     // Traverse upwards from firstInput to find enclosing question card
     let node: HTMLElement | null = firstInput.parentElement;
@@ -1366,17 +1385,17 @@ export class DOMQuestionExtractor {
           continue;
         }
         if (!sibling.querySelector('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]')) {
-          const text = this.cleanText(sibling.textContent || '');
+          const text = promptText(sibling);
           if (this.hasQuestionMark(text) && text.length >= 8 && !optionTexts.includes(text.toLowerCase())) {
             return text;
           }
 
           // Check inner elements of sibling
           const childPrompts = Array.from(sibling.querySelectorAll<HTMLElement>('div, p, span, h1, h2, h3, h4')).filter(
-            (c) => this.isPromptCandidate(c),
+            (c) => this.isPromptCandidate(c) && !isContextOnly(c),
           );
           for (let i = childPrompts.length - 1; i >= 0; i--) {
-            const childText = this.cleanText(childPrompts[i].textContent || '');
+            const childText = promptText(childPrompts[i]);
             if (this.hasQuestionMark(childText) && childText.length >= 8 && !optionTexts.includes(childText.toLowerCase())) {
               return childText;
             }
@@ -1399,8 +1418,8 @@ export class DOMQuestionExtractor {
       for (let i = preceding.length - 1; i >= 0; i--) {
         const el = preceding[i];
         if (el.querySelector('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]')) continue;
-        if (!this.isPromptCandidate(el)) continue;
-        const text = this.cleanText(el.textContent || '');
+        if (!this.isPromptCandidate(el) || isContextOnly(el)) continue;
+        const text = promptText(el);
         if (this.hasQuestionMark(text) && text.length >= 8 && !optionTexts.includes(text.toLowerCase())) {
           return text;
         }
@@ -1412,8 +1431,8 @@ export class DOMQuestionExtractor {
       );
       for (const h of headings) {
         if (h.querySelector('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]')) continue;
-        if (!this.isPromptCandidate(h)) continue;
-        const text = this.cleanText(h.textContent || '');
+        if (!this.isPromptCandidate(h) || isContextOnly(h)) continue;
+        const text = promptText(h);
         if (text.length >= 8 && !optionTexts.includes(text.toLowerCase())) {
           return text;
         }
@@ -1493,11 +1512,11 @@ export class DOMQuestionExtractor {
   }
 
   public cleanText(text: string): string {
-    return text.replace(/\s+/g, ' ').trim();
+    return stripJunkChars(text).replace(/\s+/g, ' ').trim();
   }
 
   public cleanMultilineText(text: string): string {
-    return text
+    return stripJunkChars(text)
       .split('\n')
       .map((line) => line.replace(/[ \t]+/g, ' ').trim())
       .filter((line, i, arr) => line.length > 0 || (i > 0 && arr[i - 1].length > 0))
@@ -1577,6 +1596,7 @@ export class DOMQuestionExtractor {
               '.palette, [class*="palette"], [class*="question-nav"], [id*="palette"]',
             );
             if (hasControls || isPalette) continue;
+            if (isCodeBlock(child) || findCodeBlocks(child).length > 0) continue; // code is not a passage
 
             const rect = child.getBoundingClientRect();
             const sideBySide =

@@ -99,6 +99,9 @@ npm run build
 
 ## 4. Running the Local Backend
 
+**Windows, easiest:** double-click `start-backend.cmd` in the repo root and keep its window open. It installs and builds on first run. If the extension shows the backend as offline, this window was closed: run it again. Auto-Loop waits up to 5 minutes for the backend to come back.
+
+
 Start the NestJS backend in development or production mode:
 
 ```bash

@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Drag Order Practice (E2E)</title>
+  <!--
+    E2E page for "rearrange in order" questions where the drag marker sits ONLY on the ⋮⋮ handle:
+      Q1: dnd-kit sortable (handle-only listeners, keyboard + pointer sensors), numbers in a fixed column
+      Q2: native HTML5 drag and drop with draggable="true" on the handle
+  -->
+  <script type="importmap">
+    {
+      "imports": {
+        "react": "https://esm.sh/react@18.3.1",
+        "react-dom": "https://esm.sh/react-dom@18.3.1?external=react",
+        "react-dom/client": "https://esm.sh/react-dom@18.3.1/client?external=react",
+        "@dnd-kit/core": "https://esm.sh/@dnd-kit/core@6.1.0?external=react,react-dom",
+        "@dnd-kit/sortable": "https://esm.sh/@dnd-kit/sortable@8.0.0?external=react,react-dom,@dnd-kit/core",
+        "@dnd-kit/utilities": "https://esm.sh/@dnd-kit/utilities@3.2.2?external=react"
+      }
+    }
+  </script>
+  <style>
+    body { margin: 0; font-family: system-ui, sans-serif; background: #f8fafc; color: #1e293b; }
+    .card-q { background: #fff; max-width: 760px; margin: 30px auto; padding: 28px; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+    .prompt { margin: 0 0 16px; padding-bottom: 14px; border-bottom: 1px solid #e2e8f0; }
+    .caption { font-size: 12px; color: #64748b; margin-bottom: 8px; }
+    .list { display: grid; grid-template-columns: 24px 1fr; gap: 10px 8px; align-items: center; }
+    .nums { display: contents; }
+    .num { font-size: 13px; color: #475569; }
+    .card { display: flex; align-items: center; gap: 14px; padding: 12px 14px; background: #fff; border: 1px solid #e2e8f0; border-radius: 6px; }
+    .grip { cursor: grab; color: #64748b; user-select: none; padding: 2px 4px; }
+    code { background: #eff6ff; color: #1e3a8a; padding: 1px 6px; border-radius: 4px; }
+    .actions { margin-top: 22px; display: flex; gap: 12px; align-items: center; justify-content: center; }
+    .btn { background: #2563eb; color: #fff; border: 0; padding: 9px 30px; border-radius: 6px; font-weight: 600; cursor: pointer; }
+    .done { text-align: center; padding: 40px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="module">
+    import React from 'react';
+    import { createRoot } from 'react-dom/client';
+    import { DndContext, closestCenter, KeyboardSensor, PointerSensor, useSensor, useSensors } from '@dnd-kit/core';
+    import { arrayMove, SortableContext, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable';
+    import { CSS } from '@dnd-kit/utilities';
+
+    const h = React.createElement;
+    window.__results = {};
+
+    // Text with `code` chips, like the real portal
+    const rich = (t) => t.split(/(`[^`]+`)/).map((p, i) => (p.startsWith('`') ? h('code', { key: i }, p.slice(1, -1)) : p));
+
+    const Q1 = {
+      id: 'kadane-dndkit',
+      prompt: "Rearrange the following steps of Kadane's Algorithm in the correct order:",
+      shown: [
+        'Update `maxSum` to be the maximum of `maxSum` and `curSum` .',
+        'Initialize `curSum` to `0` and `maxSum` to negative infinity.',
+        'If `curSum` becomes negative, reset it to `0` .',
+        'Iterate through each element of the array, adding the current element to `curSum` .',
+        'Return `maxSum` .',
+      ],
+      answer: [1, 3, 0, 2, 4],
+    };
+    const Q2 = {
+      id: 'tea-html5',
+      prompt: 'Arrange the following steps to make a cup of tea in the correct order:',
+      shown: ['Pour the hot water into the cup', 'Remove the tea bag and serve', 'Boil water in a kettle', 'Let the tea steep for three minutes', 'Place a tea bag in the cup'],
+      answer: [2, 4, 0, 3, 1],
+    };
+
+    function SortableRow({ id, text }) {
+      const { attributes, listeners, setNodeRef, transform, transition } = useSortable({ id });
+      return h('div', { ref: setNodeRef, className: 'card', style: { transform: CSS.Transform.toString(transform), transition } },
+        // drag marker + listeners ONLY on the handle, like the portal
+        h('span', { className: 'grip', ...attributes, ...listeners }, '⋮⋮'),
+        h('span', null, rich(text)));
+    }
+
+    function DndKitQuestion({ q, onDone }) {
+      const [order, setOrder] = React.useState(q.shown.map((_, i) => i));
+      const [verdict, setVerdict] = React.useState(null);
+      const sensors = useSensors(useSensor(PointerSensor), useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }));
+      const submit = () => {
+        const ok = JSON.stringify(order) === JSON.stringify(q.answer);
+        window.__results[q.id] = { given: order.map((i) => q.shown[i]), ok };
+        setVerdict(ok);
+      };
+      return h('div', { className: 'card-q' },
+        h('p', { className: 'prompt' }, q.prompt),
+        h('div', { className: 'caption' }, 'Drag and Drop to Order'),
+        h('div', { className: 'list' },
+          h('div', { style: { display: 'grid', gap: '10px', alignSelf: 'stretch', alignContent: 'space-around' } }, order.map((_, i) => h('span', { className: 'num', key: i }, i + 1))),
+          h(DndContext, { sensors, collisionDetection: closestCenter, onDragEnd: ({ active, over }) => {
+              if (over && active.id !== over.id) setOrder((o) => arrayMove(o, o.indexOf(active.id), o.indexOf(over.id)));
+            } },
+            h(SortableContext, { items: order, strategy: verticalListSortingStrategy },
+              h('div', { style: { display: 'grid', gap: '10px' } }, order.map((i) => h(SortableRow, { key: i, id: i, text: q.shown[i] })))))),
+        h('div', { className: 'actions' },
+          verdict === null
+            ? h('button', { className: 'btn', onClick: submit }, 'SUBMIT')
+            : [h('span', { key: 'v' }, verdict ? 'Correct!' : 'Wrong answer'), h('button', { key: 'n', className: 'btn', onClick: onDone }, 'NEXT')]));
+    }
+
+    function Html5Question({ q, onDone }) {
+      const [order, setOrder] = React.useState(q.shown.map((_, i) => i));
+      const [verdict, setVerdict] = React.useState(null);
+      const dragFrom = React.useRef(null);
+      const submit = () => {
+        const ok = JSON.stringify(order) === JSON.stringify(q.answer);
+        window.__results[q.id] = { given: order.map((i) => q.shown[i]), ok };
+        setVerdict(ok);
+      };
+      return h('div', { className: 'card-q' },
+        h('p', { className: 'prompt' }, q.prompt),
+        h('div', { className: 'caption' }, 'Drag and Drop to Order'),
+        h('div', { style: { display: 'grid', gap: '10px' } }, order.map((item, idx) =>
+          h('div', { key: item, className: 'card',
+              onDragOver: (e) => {
+                e.preventDefault();
+                const from = dragFrom.current;
+                if (from === null || from === idx) return;
+                setOrder((o) => { const n = [...o]; const [m] = n.splice(from, 1); n.splice(idx, 0, m); return n; });
+                dragFrom.current = idx;
+              },
+              onDrop: (e) => e.preventDefault() },
+            h('span', { className: 'grip', draggable: true,
+              onDragStart: (e) => { dragFrom.current = idx; e.dataTransfer.effectAllowed = 'move'; },
+              onDragEnd: () => { dragFrom.current = null; } }, '⋮⋮'),
+            h('span', null, q.shown[item])))),
+        h('div', { className: 'actions' },
+          verdict === null
+            ? h('button', { className: 'btn', onClick: submit }, 'SUBMIT')
+            : [h('span', { key: 'v' }, verdict ? 'Correct!' : 'Wrong answer'), h('button', { key: 'n', className: 'btn', onClick: onDone }, 'NEXT')]));
+    }
+
+    function App() {
+      const [step, setStep] = React.useState(0);
+      if (step === 0) return h(DndKitQuestion, { q: Q1, onDone: () => setStep(1) });
+      if (step === 1) return h(Html5Question, { q: Q2, onDone: () => setStep(2) });
+      return h('div', { className: 'card-q done', id: 'practice-done' }, 'Practice complete');
+    }
+
+    createRoot(document.getElementById('root')).render(h(App));
+  </script>
+</body>
+</html>

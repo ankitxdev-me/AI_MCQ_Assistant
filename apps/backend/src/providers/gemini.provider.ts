@@ -237,7 +237,7 @@ export class GeminiProvider implements AIProvider {
     if (modelsToTry.length === 0) {
       const soonest = Math.min(...allModels.map((m) => this.cooldownUntil.get(m) || now));
       const secs = Math.max(1, Math.ceil((soonest - now) / 1000));
-      throw new Error(`429 All Gemini models are rate limited. Please retry in ${secs}s.`);
+      throw new Error(`429 All Gemini models are busy or rate limited. Please retry in ${secs}s.`);
     }
 
     let systemPrompt = '';
@@ -564,11 +564,15 @@ STRICT INSTRUCTIONS:
             );
             break;
           }
-          // Overloaded (503 "high demand") or too slow: park it for 2 minutes, use the next model
-          const isOverloaded = /503|overloaded|high demand|service unavailable|timed out/i.test(msg);
+          // Google-side trouble: 503 "high demand", 500 "internal error", network drop, or too slow.
+          // These clear up on their own: park the model for a minute and use the next one.
+          const isOverloaded =
+            /\b50[0234]\b|overloaded|high demand|service unavailable|internal (server )?error|timed out|fetch failed|ECONNRESET|socket hang up/i.test(
+              msg,
+            );
           if (isOverloaded) {
-            this.cooldownUntil.set(currentModelName, Date.now() + 120000);
-            this.logger.warn(`${currentModelName} overloaded/slow. Skipping it for 120s.`);
+            this.cooldownUntil.set(currentModelName, Date.now() + 60000);
+            this.logger.warn(`${currentModelName} overloaded/unavailable. Skipping it for 60s.`);
             break;
           }
 
@@ -597,7 +601,7 @@ STRICT INSTRUCTIONS:
     const parked = allModels.map((m) => this.cooldownUntil.get(m) || 0).filter((t) => t > after);
     if (parked.length === allModels.length) {
       const secs = Math.max(1, Math.ceil((Math.min(...parked) - after) / 1000));
-      throw new Error(`429 All Gemini models are rate limited. Please retry in ${secs}s.`);
+      throw new Error(`429 All Gemini models are busy or rate limited. Please retry in ${secs}s.`);
     }
     throw new Error(
       `Failed to generate answer across all available models: ${lastError?.message || 'Unknown error'}`,

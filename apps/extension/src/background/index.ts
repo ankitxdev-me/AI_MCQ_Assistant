@@ -72,7 +72,9 @@ async function fetchBackend(endpoint: string, options: RequestInit = {}): Promis
     });
   } catch (err: any) {
     if (err?.name === 'TimeoutError') throw new Error('Backend request timed out');
-    throw new Error(`Failed to fetch: backend not reachable at ${BACKEND_BASE_URL} (${err?.message || err})`);
+    throw new Error(
+      `Failed to fetch: backend is not running at ${BACKEND_BASE_URL}. Double-click start-backend.cmd in the AI_MCQ_Assistant folder.`,
+    );
   }
 
   if (!response.ok) {

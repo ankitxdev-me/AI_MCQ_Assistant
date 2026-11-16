@@ -1,5 +1,6 @@
 import { QuestionImageRef, QuestionImagePayload } from '@ai-mcq/shared-types';
 import { isRendered, isOptionRendered } from './visibility';
+import { findCodeBlocks, codeText, isCodeBlock, stripJunkChars } from './code';
 
 /**
  * Rich question context: tables, code and images that sit around a question's options.
@@ -84,7 +85,7 @@ export function tableToMarkdown(table: HTMLTableElement): string {
 
 function linesText(lines: Element[]): string {
   return lines
-    .map((l) => (l.textContent || '').replace(/ /g, ' ').replace(/​/g, ''))
+    .map((l) => stripJunkChars((l.textContent || '').replace(/ /g, ' ')))
     .join('\n')
     .replace(/\n+$/, '');
 }
@@ -121,11 +122,10 @@ export function extractCodeBlocks(region: Element): string[] {
   region.querySelectorAll('.ace_text-layer').forEach((el) => {
     if (isRendered(el)) push(linesText(Array.from(el.querySelectorAll('.ace_line'))));
   });
-  // Plain <pre> blocks outside editors
-  region.querySelectorAll('pre').forEach((el) => {
-    if (el.closest(CODE_EDITOR_SELECTOR) || el.closest('label') || !isRendered(el)) return;
-    if (el.querySelector(OPTION_CONTROL_SELECTOR)) return;
-    push((el as HTMLElement).innerText || el.textContent || '');
+  // Any other code panel: <pre>, or the portal's own monospace block with a line-number gutter
+  findCodeBlocks(region).forEach((el) => {
+    if (el.closest(CODE_EDITOR_SELECTOR)) return; // read above, line by line
+    push(codeText(el));
   });
 
   return blocks;
@@ -250,7 +250,8 @@ export function nearbyQuestionText(optionEls: Element[], region: Element): strin
         el.matches(
           'button, [role="button"], input, textarea, select, script, style, noscript, template, iframe, svg, header, nav, footer, [role="banner"], [role="navigation"], [role="radio"], [role="checkbox"]',
         ) ||
-        !isRendered(el);
+        !isRendered(el) ||
+        isCodeBlock(el);
       if (drop) cloneAll[i].remove();
     });
     const text = (clone.textContent || '')

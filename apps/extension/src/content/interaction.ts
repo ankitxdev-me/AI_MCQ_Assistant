@@ -1,6 +1,7 @@
 import { OptionItem } from '@ai-mcq/shared-types';
 import { isOptionRendered, isRendered } from './visibility';
 import { sleep } from './timing';
+import { expandToItemRows } from './dnd';
 
 export class DOMInteractionManager {
   /**
@@ -435,7 +436,7 @@ export class DOMInteractionManager {
     const ITEM_SELECTOR =
       '[data-rbd-draggable-id], [data-rfd-draggable-id], [aria-roledescription="sortable"], [aria-roledescription="draggable"], [draggable="true"]';
     const HANDLE_SELECTOR =
-      '[data-rbd-drag-handle-draggable-id], [data-rfd-drag-handle-draggable-id], [aria-roledescription="sortable"], [aria-roledescription="draggable"], [class*="handle" i], [class*="grip" i]';
+      '[data-rbd-drag-handle-draggable-id], [data-rfd-drag-handle-draggable-id], [aria-roledescription="sortable"], [aria-roledescription="draggable"], [draggable="true"], [class*="handle" i], [class*="grip" i], [class*="drag" i]';
     const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
 
     const getItems = (): HTMLElement[] => {
@@ -445,8 +446,8 @@ export class DOMInteractionManager {
         if (children.length >= 2) return children;
       }
       let items = Array.from(document.querySelectorAll<HTMLElement>(ITEM_SELECTOR)).filter((el) => isRendered(el));
-      // Keep the outermost draggable when both an item and its handle carry markers
-      items = items.filter((el) => !items.some((other) => other !== el && other.contains(el)));
+      // Markers may be only on the ⋮⋮ handles: work with each handle's whole row (with the text)
+      items = expandToItemRows(items);
       if (items.length >= 2) return items.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
 
       const fromSelectors = options
@@ -550,7 +551,9 @@ export class DOMInteractionManager {
       }
     };
 
-    const html5Move = async (el: HTMLElement, dest: HTMLElement, down: boolean) => {
+    const html5Move = async (row: HTMLElement, dest: HTMLElement, down: boolean) => {
+      // Native drag must start on the element that is actually draggable (often just the handle)
+      const el = row.matches('[draggable="true"]') ? row : row.querySelector<HTMLElement>('[draggable="true"]') || row;
       const dt = new DataTransfer();
       dt.setData('text/plain', el.textContent || '');
       const s = el.getBoundingClientRect();

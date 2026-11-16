@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Pseudo Code MCQ (E2E)</title>
+  <!-- Layout of the portal's pseudo-code question: custom code panel with a line-number gutter,
+       indent-guide glyphs, a scrollable body, and radio options below an <hr>. -->
+  <style>
+    body { font-family: system-ui, sans-serif; background: #f8fafc; color: #1e293b; }
+    .card { max-width: 720px; margin: 30px auto; background: #fff; padding: 28px; border-radius: 8px; }
+    .code { display: grid; grid-template-columns: 32px 1fr; background: #0f172a; color: #e2e8f0;
+            font-family: 'Fira Code', Consolas, monospace; font-size: 12px; line-height: 1.6;
+            padding: 16px; max-height: 150px; overflow-y: auto; width: 380px; border-radius: 4px; }
+    .gutter { color: #64748b; text-align: right; padding-right: 12px; user-select: none; }
+    .guide { color: #334155; }
+    label { display: block; margin: 12px 0; }
+    .btn { background: #2563eb; color: #fff; border: 0; padding: 8px 32px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div>
+      <p>What is the primary objective of the below pseudo code :</p>
+      <div class="code" id="code"></div>
+    </div>
+    <hr />
+    <label><input type="radio" name="opt" value="a" /> To find the product of two numbers</label>
+    <label><input type="radio" name="opt" value="b" /> To reverse a linked list</label>
+    <label><input type="radio" name="opt" value="c" /> To compare two numbers</label>
+    <label><input type="radio" name="opt" value="d" /> To calculate the sum of two numbers represented as linked lists</label>
+    <button class="btn" onclick="window.__submitted = document.querySelector('input:checked')?.value">SUBMIT</button>
+  </div>
+  <script>
+    const code = [
+      'f(Node a,Node b)', '    temp1=a', '    temp2=b', '    carry=0', '    ans=new Node(-1)', '    cur=ans',
+      '    while(temp1!=null || temp2!=null)', '        sum=carry', '        if(temp1!=null)', '            sum = sum + temp1->data',
+      '            temp1=temp1->next', '        if(temp2!=null)', '            sum = sum + temp2->data', '            temp2=temp2->next',
+      '        carry = sum/10', '        cur->next = new Node(sum%10)', '        cur = cur->next', '    if(carry>0)',
+      '        cur->next = new Node(carry)', '    return ans->next',
+    ];
+    const el = document.getElementById('code');
+    const gutter = document.createElement('div');
+    gutter.className = 'gutter';
+    const body = document.createElement('div');
+    code.forEach((line, i) => {
+      const n = document.createElement('div'); n.textContent = i + 1; gutter.appendChild(n);
+      const l = document.createElement('div');
+      const depth = (line.match(/^ */)[0].length / 4) | 0;
+      // indent guides drawn with a glyph from an icon font (private use area)
+      for (let d = 1; d < depth; d++) { const g = document.createElement('span'); g.className = 'guide'; g.textContent = ''; l.appendChild(g); }
+      l.appendChild(document.createTextNode(line.trimStart()));
+      l.style.paddingLeft = depth * 16 + 'px';
+      body.appendChild(l);
+    });
+    el.append(gutter, body);
+  </script>
+</body>
+</html>

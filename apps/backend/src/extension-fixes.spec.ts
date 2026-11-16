@@ -179,6 +179,42 @@ describe('Extension fixes', () => {
     expect(extractor.extractAllQuestions()).toHaveLength(0);
   });
 
+  it('keeps a custom code panel (line-number gutter) out of the prompt text', () => {
+    const lines = ['f(Node a,Node b)', 'temp1=a', 'temp2=b', 'carry=0', 'ans=new Node(-1)'];
+    document.body.innerHTML = `
+      <div class="q">
+        <div>
+          <p>What is the primary objective of the below pseudo code :</p>
+          <div class="code-view" style="font-family: 'Fira Code', monospace">
+            <div class="gutter">${lines.map((_, i) => `<div>${i + 1}</div>`).join('')}</div>
+            <div class="lines">${lines.map((l) => `<div><span class="guide">םםםם</span>${l}</div>`).join('')}</div>
+          </div>
+        </div>
+        <hr/>
+        <div><label><input type="radio" name="p" value="1"> To find the product of two numbers</label></div>
+        <div><label><input type="radio" name="p" value="2"> To reverse a linked list</label></div>
+        <div><label><input type="radio" name="p" value="3"> To calculate the sum of two numbers represented as linked lists</label></div>
+      </div>`;
+    const [q] = extractor.extractAllQuestions();
+    const prompt = q.questionText.split('[CODE]')[0];
+    expect(prompt).toContain('primary objective of the below pseudo code');
+    expect(prompt).not.toMatch(/12345/);
+    expect(prompt).not.toContain('temp1=a');
+    expect(q.questionText).toContain('[CODE]');
+    expect(q.questionText).toContain('temp1=a');
+    expect(q.questionText).not.toContain('םםםם');
+    expect(q.options).toHaveLength(3);
+  });
+
+  it('strips line-number gutters and junk glyphs from code text', () => {
+    const { stripLineNumbers, stripJunkChars } = require('../../extension/src/content/code');
+    expect(stripLineNumbers('1\n2\n3\nf(a)\nx=1\ny=2')).toBe('f(a)\nx=1\ny=2');
+    expect(stripLineNumbers('1234567891011f(Node a,Node b)\ntemp1=a')).toBe('f(Node a,Node b)\ntemp1=a');
+    expect(stripLineNumbers('1 let a = 1\n2 let b = 2\n3 print(a)')).toBe('let a = 1\nlet b = 2\nprint(a)');
+    expect(stripLineNumbers('x = 10\nprint(x)')).toBe('x = 10\nprint(x)'); // no gutter: unchanged
+    expect(stripJunkChars('if(a) ││││ sum = ____')).toBe('if(a)  sum = ____');
+  });
+
   it('detects sequence wording like "set the following options in sequence"', () => {
     expect(extractor.isOrderingPrompt('Set the following options in sequence')).toBe(true);
     expect(extractor.isOrderingPrompt('Arrange the steps in the correct order')).toBe(true);

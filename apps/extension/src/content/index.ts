@@ -2,7 +2,8 @@ import { DOMQuestionExtractor, VISUAL_PLACEHOLDER_PROMPT } from './extractor';
 import { DOMInteractionManager } from './interaction';
 import { DOMQuestionObserver } from './observer';
 import { matchAIAnswerToOptions, matchAIMultipleAnswersToOptions } from './matcher';
-import { buildMediaRequest, regionScreenshotRect, ResolvedMedia } from './media';
+import { buildMediaRequest, regionScreenshotRect, ResolvedMedia, resolveOptionElement } from './media';
+import { domSkeleton } from './dnd';
 import { sleep } from './timing';
 import { ExtensionMessage, ExtractedQuestion } from '@ai-mcq/shared-types';
 
@@ -318,9 +319,14 @@ function initContentScript(): void {
 
   // Errors that retrying cannot fix. The loop must stop and say why.
   const FATAL_ERROR =
-    /not configured|pairing token|api key|api_key|permission denied|failed to fetch|not reachable|session is (paused|stopped)|extension context invalidated/i;
+    /not configured|pairing token|api key|api_key|permission denied|session is (paused|stopped)|extension context invalidated/i;
+  // The local backend is not running (window closed, PC restarted). Wait for it instead of quitting.
+  const BACKEND_DOWN = /failed to fetch|not reachable|backend is not running|networkerror/i;
+  const BACKEND_WAIT_LIMIT = 60; // x 5s = 5 minutes
   // Gemini busy / rate limited / slow: wait longer and try again, do not give up quickly.
-  const BUSY_ERROR = /429|quota|rate.?limit|resource.?exhausted|overloaded|unavailable|503|timed out|timeout|message port closed/i;
+  const BUSY_ERROR =
+    /429|quota|rate.?limit|resource.?exhausted|overloaded|unavailable|high demand|\b50[0234]\b|internal (server )?error|busy|timed out|timeout|message port closed/i;
+  let backendWaits = 0;
 
   function startAutoLoop(): void {
     runId++;
@@ -454,6 +460,17 @@ function initContentScript(): void {
           finish(`⏸️ Stopped: ${reason}`);
           return;
         }
+        if (BACKEND_DOWN.test(reason)) {
+          backendWaits++;
+          if (backendWaits > BACKEND_WAIT_LIMIT) {
+            finish('⏸️ Backend is offline. Double-click start-backend.cmd in the AI_MCQ_Assistant folder, then restart Auto-Loop.');
+            return;
+          }
+          loopStatus = '🔌 Backend offline. Start it with start-backend.cmd; continuing automatically when it is back...';
+          scheduleCycle(run, 5000);
+          return;
+        }
+        backendWaits = 0;
         if (BUSY_ERROR.test(reason)) {
           busyRetries++;
           const askedSecs = Number((reason.match(/retry in (\d+(?:\.\d+)?)\s*s/i) || [])[1]);
@@ -480,6 +497,7 @@ function initContentScript(): void {
 
       failures = 0;
       busyRetries = 0;
+      backendWaits = 0;
       if (response.data.sessionId) sessionId = response.data.sessionId;
       answers.set(q.fingerprint, answer);
       trace('answer', {
@@ -507,8 +525,15 @@ function initContentScript(): void {
           return;
         }
         loopStatus = `2. Dragging into order [${seq.join(' → ')}]...`;
+        const firstRow = resolveOptionElement(q.options[0]?.elementSelector);
+        const listEl = firstRow?.parentElement;
         const reorder = await interaction.reorderOptions(seq, q.options);
         if (!alive()) return;
+        trace('ordering', {
+          ok: reorder.success,
+          message: reorder.message,
+          dom: listEl ? domSkeleton(listEl) : 'list not found',
+        });
         if (!reorder.success) {
           finish(`⏸️ ${reorder.message}. Arrange it manually as [${seq.join(' → ')}].`);
           return;

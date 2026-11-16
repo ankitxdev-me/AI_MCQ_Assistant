@@ -27,6 +27,15 @@
       }
       case 'BACKEND_FETCH': {
         const body = JSON.parse(msg.payload.options.body || '{}');
+        if (msg.payload.endpoint !== '/api/questions/solve') {
+          // e.g. loop-log diagnostics: pass straight through to the backend
+          const r = await fetch('http://127.0.0.1:3000' + msg.payload.endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-pairing-token': TOKEN },
+            body: msg.payload.options.body,
+          });
+          return { success: r.ok, data: await r.json().catch(() => ({})) };
+        }
         const entry = {
           question: body.question,
           options: body.options,
