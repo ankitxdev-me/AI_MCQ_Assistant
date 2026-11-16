@@ -14,6 +14,7 @@ import {
 interface HeaderProps {
   backendOnline: boolean;
   geminiConfigured: boolean;
+  keyCount?: number;
   onOpenSettings: () => void;
   onRefresh: () => void;
   isRefreshing?: boolean;
@@ -26,6 +27,7 @@ interface HeaderProps {
 export const Header: React.FC<HeaderProps> = ({
   backendOnline,
   geminiConfigured,
+  keyCount,
   onOpenSettings,
   onRefresh,
   isRefreshing,
@@ -77,14 +79,20 @@ export const Header: React.FC<HeaderProps> = ({
                 ? 'bg-blue-50 text-blue-700 border border-blue-200'
                 : 'bg-amber-50 text-amber-700 border border-amber-200'
             }`}
-            title={geminiConfigured ? 'Gemini Ready' : 'Gemini Key Needed'}
+            title={
+              geminiConfigured
+                ? keyCount && keyCount > 1
+                  ? `Gemini Ready (${keyCount} keys in fallback rotation pool)`
+                  : 'Gemini Ready'
+                : 'Gemini Key Needed'
+            }
           >
             {geminiConfigured ? (
               <CheckCircle2 className="h-3 w-3 text-blue-600" />
             ) : (
               <AlertCircle className="h-3 w-3 text-amber-600" />
             )}
-            AI
+            {geminiConfigured && keyCount && keyCount > 1 ? `AI (${keyCount}k)` : 'AI'}
           </span>
         </div>
 

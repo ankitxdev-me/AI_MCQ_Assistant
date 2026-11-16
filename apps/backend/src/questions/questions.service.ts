@@ -175,10 +175,10 @@ export class QuestionsService {
     }
 
     // 2. Fetch AI credentials & topic knowledge
-    const apiKey = this.configService.getActiveApiKey();
-    if (!apiKey) {
+    const apiKeys = this.configService.getActiveApiKeys();
+    if (apiKeys.length === 0) {
       throw new BadRequestException(
-        'AI Provider is not configured. Please configure your Gemini API Key in the extension settings.',
+        'AI Provider is not configured. Please configure your Gemini API Key(s) in the extension settings.',
       );
     }
     const model = this.configService.getActiveModel();
@@ -227,7 +227,7 @@ export class QuestionsService {
           isOrderingQuestion: payload.isOrderingQuestion,
           questionType: payload.questionType,
         },
-        apiKey,
+        apiKeys,
         model,
         topicKnowledge,
         customKnowledgeText,

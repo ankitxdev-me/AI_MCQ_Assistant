@@ -20,6 +20,7 @@ import { z } from 'zod';
 
 const TestConfigSchema = z.object({
   apiKey: z.string().optional(),
+  apiKeys: z.array(z.string()).optional(),
   model: z.string().optional(),
 });
 
@@ -39,7 +40,7 @@ export class ConfigController {
     @Body(new ZodValidationPipe(AIProviderConfigSchema))
     body: z.infer<typeof AIProviderConfigSchema>,
   ) {
-    return this.configService.saveGeminiConfig(body.apiKey, body.model);
+    return this.configService.saveGeminiConfig(body.apiKey, body.model, body.apiKeys);
   }
 
   @Post('model')
@@ -54,7 +55,7 @@ export class ConfigController {
     @Body(new ZodValidationPipe(TestConfigSchema))
     body: z.infer<typeof TestConfigSchema>,
   ): Promise<TestConnectionResponse> {
-    return this.configService.testConnection(body.apiKey, body.model);
+    return this.configService.testConnection(body.apiKeys || body.apiKey, body.model);
   }
 
   @Delete('provider')

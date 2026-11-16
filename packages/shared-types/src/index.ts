@@ -319,12 +319,14 @@ export const CreateSessionDtoSchema = z.object({
 export interface AIProviderConfig {
   provider: 'gemini' | 'openai';
   apiKey: string;
+  apiKeys?: string[];
   model: string;
 }
 
 export const AIProviderConfigSchema = z.object({
   provider: z.literal('gemini'),
   apiKey: z.string().min(10, 'Gemini API key is required'),
+  apiKeys: z.array(z.string().min(10)).optional(),
   model: z.string().min(1),
 });
 
@@ -337,6 +339,10 @@ export interface ConfigStatusResponse {
   availableModels: string[];
   lastTested?: string;
   pairingTokenConfigured: boolean;
+  keyCount?: number;
+  activeKeyIndex?: number;
+  maskedKeys?: string[];
+  keyCooldowns?: { keyIndex: number; maskedKey: string; secondsLeft: number }[];
 }
 
 export interface TestConnectionResponse {

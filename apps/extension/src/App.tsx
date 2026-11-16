@@ -526,6 +526,7 @@ export const App: React.FC = () => {
       <Header
         backendOnline={backendOnline}
         geminiConfigured={!!configStatus?.configured}
+        keyCount={configStatus?.keyCount}
         onOpenSettings={() => setCurrentScreen('setup')}
         onRefresh={triggerExtraction}
         isRefreshing={isRefreshing}

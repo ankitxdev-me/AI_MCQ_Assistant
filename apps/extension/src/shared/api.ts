@@ -71,17 +71,17 @@ export const ApiClient = {
     return requestBackend('/api/config/status');
   },
 
-  async saveGeminiConfig(apiKey: string, model: string): Promise<ConfigStatusResponse> {
+  async saveGeminiConfig(apiKey: string, model: string, apiKeys?: string[]): Promise<ConfigStatusResponse> {
     return requestBackend('/api/config/gemini', {
       method: 'POST',
-      body: JSON.stringify({ provider: 'gemini', apiKey, model }),
+      body: JSON.stringify({ provider: 'gemini', apiKey, model, apiKeys }),
     });
   },
 
-  async testConnection(apiKey?: string, model?: string): Promise<TestConnectionResponse> {
+  async testConnection(apiKey?: string, model?: string, apiKeys?: string[]): Promise<TestConnectionResponse> {
     return requestBackend('/api/config/test', {
       method: 'POST',
-      body: JSON.stringify({ apiKey, model }),
+      body: JSON.stringify({ apiKey, model, apiKeys }),
     });
   },
 

@@ -26,7 +26,8 @@ export class ConfigService {
       `SELECT value FROM configs WHERE key = 'last_tested'`,
     );
 
-    const envKey = process.env.GEMINI_API_KEY;
+    const keys = this.getActiveApiKeys();
+    const envKey = process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEYS;
     const hasDbKey = !!dbKeyRow?.value;
     const hasEnvFallback = !!envKey;
 
@@ -37,11 +38,13 @@ export class ConfigService {
       source = 'environment';
     }
 
-    const isConfigured = hasDbKey || hasEnvFallback;
+    const isConfigured = keys.length > 0;
     const selectedModel =
+      dbModelRow?.value || process.env.GEMINI_DEFAULT_MODEL || GeminiProvider.DEFAULT_MODEL;
 
-      dbModelRow?.value || process.env.GEMINI_DEFAULT_MODEL || 'gemini-flash-lite-latest';
-
+    const maskedKeys = keys.map((k) => this.geminiProvider.maskKey(k));
+    const activeKeyIndex = this.geminiProvider.getActiveKeyIndex(keys);
+    const keyCooldowns = this.geminiProvider.getKeyCooldowns(keys);
 
     return {
       configured: isConfigured,
@@ -52,22 +55,60 @@ export class ConfigService {
       availableModels: this.geminiProvider.getAvailableModels(),
       lastTested: lastTestedRow?.value,
       pairingTokenConfigured: !!(process.env.API_PAIRING_TOKEN || 'ai_mcq_assistant_secret_token_change_in_production'),
+      keyCount: keys.length,
+      activeKeyIndex,
+      maskedKeys,
+      keyCooldowns,
     };
   }
 
-  getActiveApiKey(): string | null {
-    // 1. User configured key in DB
+  getActiveApiKeys(): string[] {
+    // 1. Check gemini_api_keys JSON array in DB
+    const dbKeysRow = this.db.queryOne<{ value: string }>(
+      `SELECT value FROM configs WHERE key = 'gemini_api_keys'`,
+    );
+    if (dbKeysRow?.value) {
+      try {
+        const parsed = JSON.parse(dbKeysRow.value);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          const valid = parsed.map((k) => String(k).trim()).filter((k) => k.length > 0);
+          if (valid.length > 0) return Array.from(new Set(valid));
+        }
+      } catch {
+        // Fall through
+      }
+    }
+
+    // 2. Check legacy single gemini_api_key in DB (split by newlines/commas)
     const dbKeyRow = this.db.queryOne<{ value: string }>(
       `SELECT value FROM configs WHERE key = 'gemini_api_key'`,
     );
     if (dbKeyRow?.value) {
-      return dbKeyRow.value;
+      const split = dbKeyRow.value
+        .split(/[\r\n,;]+/)
+        .map((k) => k.trim())
+        .filter((k) => k.length > 0);
+      if (split.length > 0) return Array.from(new Set(split));
     }
-    // 2. Development environment fallback
+
+    // 3. Environment variables fallback
+    if (process.env.GEMINI_API_KEYS) {
+      const envKeys = process.env.GEMINI_API_KEYS.split(/[\r\n,;]+/)
+        .map((k) => k.trim())
+        .filter((k) => k.length > 0);
+      if (envKeys.length > 0) return Array.from(new Set(envKeys));
+    }
     if (process.env.GEMINI_API_KEY) {
-      return process.env.GEMINI_API_KEY;
+      const k = process.env.GEMINI_API_KEY.trim();
+      if (k.length > 0) return [k];
     }
-    return null;
+
+    return [];
+  }
+
+  getActiveApiKey(): string | null {
+    const keys = this.getActiveApiKeys();
+    return keys.length > 0 ? keys[0] : null;
   }
 
   getActiveModel(): string {
@@ -77,18 +118,46 @@ export class ConfigService {
     return dbModelRow?.value || process.env.GEMINI_DEFAULT_MODEL || GeminiProvider.DEFAULT_MODEL;
   }
 
-  async saveGeminiConfig(apiKey: string, model: string = GeminiProvider.DEFAULT_MODEL) {
+  async saveGeminiConfig(
+    apiKeyInput: string | string[],
+    model: string = GeminiProvider.DEFAULT_MODEL,
+    additionalKeys?: string[],
+  ) {
+    const rawKeys: string[] = [];
+    if (Array.isArray(apiKeyInput)) {
+      rawKeys.push(...apiKeyInput);
+    } else if (typeof apiKeyInput === 'string') {
+      rawKeys.push(...apiKeyInput.split(/[\r\n,;]+/));
+    }
+
+    if (Array.isArray(additionalKeys)) {
+      rawKeys.push(...additionalKeys);
+    }
+
+    const cleanedKeys = Array.from(new Set(rawKeys.map((k) => k.trim()).filter((k) => k.length > 0)));
     const now = new Date().toISOString();
-    this.db.run(
-      `INSERT OR REPLACE INTO configs (key, value, updated_at) VALUES ('gemini_api_key', ?, ?)`,
-      [apiKey.trim(), now],
-    );
+
+    if (cleanedKeys.length > 0) {
+      // Save primary key for legacy compatibility
+      this.db.run(
+        `INSERT OR REPLACE INTO configs (key, value, updated_at) VALUES ('gemini_api_key', ?, ?)`,
+        [cleanedKeys[0], now],
+      );
+      // Save full array of keys in gemini_api_keys
+      this.db.run(
+        `INSERT OR REPLACE INTO configs (key, value, updated_at) VALUES ('gemini_api_keys', ?, ?)`,
+        [JSON.stringify(cleanedKeys), now],
+      );
+    }
+
     this.db.run(
       `INSERT OR REPLACE INTO configs (key, value, updated_at) VALUES ('gemini_model', ?, ?)`,
       [model.trim(), now],
     );
 
-    this.logger.log('Gemini API configuration securely saved in local database');
+    this.logger.log(
+      `Gemini API configuration securely saved in local database (${cleanedKeys.length} key(s) in fallback pool)`,
+    );
     return this.getConfigStatus();
   }
 
@@ -102,21 +171,33 @@ export class ConfigService {
     return this.getConfigStatus();
   }
 
-  async testConnection(testApiKey?: string, testModel?: string): Promise<TestConnectionResponse> {
-    const apiKey = testApiKey || this.getActiveApiKey();
+  async testConnection(
+    testApiKey?: string | string[],
+    testModel?: string,
+  ): Promise<TestConnectionResponse> {
+    let keysToTest: string[] = [];
+    if (Array.isArray(testApiKey)) {
+      keysToTest = testApiKey;
+    } else if (typeof testApiKey === 'string' && testApiKey.trim().length > 0) {
+      keysToTest = testApiKey.split(/[\r\n,;]+/);
+    } else {
+      keysToTest = this.getActiveApiKeys();
+    }
+
+    const cleanedKeys = Array.from(new Set(keysToTest.map((k) => k.trim()).filter((k) => k.length > 0)));
     const model = testModel || this.getActiveModel();
 
-    if (!apiKey) {
+    if (cleanedKeys.length === 0) {
       return {
         success: false,
-        message: 'No API key configured to test. Please provide an API key.',
+        message: 'No API key configured to test. Please provide at least one API key.',
         modelTested: model,
         timestamp: new Date().toISOString(),
       };
     }
 
     const testResult = await this.geminiProvider.validateConnection({
-      apiKey,
+      apiKeys: cleanedKeys,
       model,
     });
 
@@ -136,7 +217,9 @@ export class ConfigService {
   }
 
   deleteProviderConfig() {
-    this.db.run(`DELETE FROM configs WHERE key IN ('gemini_api_key', 'gemini_model', 'last_tested')`);
+    this.db.run(
+      `DELETE FROM configs WHERE key IN ('gemini_api_key', 'gemini_api_keys', 'gemini_model', 'last_tested')`,
+    );
     this.logger.log('Gemini API configuration removed from local database');
     return this.getConfigStatus();
   }

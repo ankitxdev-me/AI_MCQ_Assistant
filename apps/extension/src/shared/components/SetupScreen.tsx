@@ -25,12 +25,21 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
   } | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
+  const detectedKeys = apiKey
+    .split(/[\r\n,;]+/)
+    .map((k) => k.trim())
+    .filter((k) => k.length >= 10);
+
   const handleTest = async () => {
     setIsTesting(true);
     setTestResult(null);
     setErrorMsg(null);
     try {
-      const res = await ApiClient.testConnection(apiKey.trim() || undefined, model);
+      const res = await ApiClient.testConnection(
+        apiKey.trim() || undefined,
+        model,
+        detectedKeys.length > 0 ? detectedKeys : undefined,
+      );
       setTestResult({
         success: res.success,
         message: res.message,
@@ -47,15 +56,19 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!apiKey.trim() && !configStatus?.hasEnvFallback) {
-      setErrorMsg('Please enter your Gemini API key');
+    if (!apiKey.trim() && !configStatus?.hasEnvFallback && (!configStatus?.maskedKeys || configStatus.maskedKeys.length === 0)) {
+      setErrorMsg('Please enter at least one Gemini API key');
       return;
     }
 
     setIsSaving(true);
     setErrorMsg(null);
     try {
-      await ApiClient.saveGeminiConfig(apiKey.trim(), model);
+      await ApiClient.saveGeminiConfig(
+        apiKey.trim() || (configStatus?.maskedKeys ? 'KEEP_EXISTING' : ''),
+        model,
+        detectedKeys.length > 0 ? detectedKeys : undefined,
+      );
       onConfigSaved();
     } catch (err: any) {
       setErrorMsg(err.message || 'Failed to save configuration');
@@ -120,7 +133,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
           <div>
             <div className="flex items-center justify-between mb-1">
               <label className="block text-xs font-medium text-slate-700">
-                Gemini API Key
+                Gemini API Keys <span className="text-slate-400 font-normal">(Multi-Account Fallback Pool)</span>
               </label>
               <a
                 href="https://aistudio.google.com/app/apikey"
@@ -131,24 +144,74 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
                 Get API Key
               </a>
             </div>
+
             <div className="relative">
-              <input
-                type={showKey ? 'text' : 'password'}
-                placeholder={configStatus?.configured ? '••••••••••••••••••••••••' : 'AIzaSy...'}
+              <textarea
+                rows={3}
+                placeholder={
+                  configStatus?.configured
+                    ? 'Paste new API key(s) here to replace (one per line or comma-separated)...'
+                    : 'AIzaSy... (Account 1)\nAIzaSy... (Account 2)\nAIzaSy... (Account 3)'
+                }
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
-                className="w-full text-xs rounded-lg border border-slate-300 px-3 py-2 pr-9 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 font-mono"
+                className="w-full text-xs rounded-lg border border-slate-300 p-2.5 pr-9 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 font-mono resize-y"
               />
               <button
                 type="button"
                 onClick={() => setShowKey(!showKey)}
                 className="absolute right-2.5 top-2.5 text-slate-400 hover:text-slate-600"
+                title={showKey ? 'Hide key characters' : 'Show key characters'}
               >
                 {showKey ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
               </button>
             </div>
+
+            {detectedKeys.length > 0 && (
+              <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-blue-700 bg-blue-50 border border-blue-200 px-2 py-1 rounded">
+                <Sparkles className="h-3.5 w-3.5 text-blue-600 flex-shrink-0" />
+                <span>
+                  <strong>{detectedKeys.length} API key{detectedKeys.length > 1 ? 's' : ''} detected</strong> for automatic failover rotation pool.
+                </span>
+              </div>
+            )}
+
+            {configStatus?.maskedKeys && configStatus.maskedKeys.length > 0 && !apiKey.trim() && (
+              <div className="mt-2 p-2 bg-slate-50 border border-slate-200 rounded-lg">
+                <div className="text-[11px] font-semibold text-slate-700 mb-1 flex items-center justify-between">
+                  <span>Configured Keys in Pool ({configStatus.maskedKeys.length}):</span>
+                  {configStatus.activeKeyIndex !== undefined && (
+                    <span className="text-[10px] bg-emerald-100 text-emerald-800 px-1.5 py-0.5 rounded font-medium">
+                      Active: Key #{configStatus.activeKeyIndex + 1}
+                    </span>
+                  )}
+                </div>
+                <div className="space-y-1">
+                  {configStatus.maskedKeys.map((mk, idx) => {
+                    const cooldown = configStatus.keyCooldowns?.find((c) => c.keyIndex === idx);
+                    return (
+                      <div key={idx} className="flex items-center justify-between text-[11px] font-mono text-slate-600">
+                        <span>
+                          Key {idx + 1}: {mk}
+                        </span>
+                        {cooldown ? (
+                          <span className="text-[10px] text-amber-700 bg-amber-50 px-1.5 rounded">
+                            Cooldown: {cooldown.secondsLeft}s
+                          </span>
+                        ) : idx === (configStatus.activeKeyIndex || 0) ? (
+                          <span className="text-[10px] text-emerald-700 font-semibold">● Ready (Active)</span>
+                        ) : (
+                          <span className="text-[10px] text-slate-400">Standby Fallback</span>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
             <p className="text-[10px] text-slate-400 mt-1">
-              Your key is stored strictly on your local computer SQLite database and never leaves localhost.
+              ⚡ <strong>Zero Interruption:</strong> Add 2-5 API keys from different Google accounts. If one hits rate limits or a 1-10hr block, the assistant automatically switches to the next account in cycle!
             </p>
           </div>
 

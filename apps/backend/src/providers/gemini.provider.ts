@@ -75,6 +75,7 @@ export class GeminiProvider implements AIProvider {
     return this.waiting.length;
   }
   private readonly availableModels = [
+    'gemini-3.5-flash-lite',
     'gemini-flash-lite-latest',
     'gemini-3.1-flash-lite',
     'gemini-3.6-flash',
@@ -91,84 +92,137 @@ export class GeminiProvider implements AIProvider {
     'gemini-3.5-flash-lite',
     'gemini-2.5-flash',
     'gemini-flash-latest',
-
   ];
 
   /** Model -> time (ms) until which it is rate limited. Skipped until then, no waiting. */
   private readonly cooldownUntil = new Map<string, number>();
+
+  /** Multi-API Key fallback pool state */
+  private currentKeyIndex = 0;
+  private readonly keyCooldownUntil = new Map<string, number>();
+
+  maskKey(key: string): string {
+    if (!key) return '';
+    const clean = key.trim();
+    if (clean.length <= 10) return '••••••••';
+    return `${clean.slice(0, 6)}...${clean.slice(-4)}`;
+  }
+
+  getActiveKeyIndex(keys: string[]): number {
+    if (keys.length === 0) return 0;
+    return this.currentKeyIndex % keys.length;
+  }
+
+  getKeyCooldowns(keys: string[]): { keyIndex: number; maskedKey: string; secondsLeft: number }[] {
+    const now = Date.now();
+    return keys
+      .map((k, idx) => {
+        const until = this.keyCooldownUntil.get(k) || 0;
+        return {
+          keyIndex: idx,
+          maskedKey: this.maskKey(k),
+          secondsLeft: Math.max(0, Math.ceil((until - now) / 1000)),
+        };
+      })
+      .filter((c) => c.secondsLeft > 0);
+  }
 
   /** Rate-limit state per model, for logs and the health endpoint. */
   getCooldowns(): { model: string; secondsLeft: number }[] {
     const now = Date.now();
     return Array.from(this.cooldownUntil.entries())
       .filter(([, until]) => until > now)
-      .map(([model, until]) => ({ model, secondsLeft: Math.ceil((until - now) / 1000) }));
+      .map(([km, until]) => {
+        const parts = km.split(':');
+        const model = parts.length > 1 ? parts.slice(1).join(':') : parts[0];
+        return { model, secondsLeft: Math.ceil((until - now) / 1000) };
+      });
   }
 
   getAvailableModels(): string[] {
     return this.availableModels;
   }
 
-  async validateConnection(testConfig?: { apiKey: string; model?: string }): Promise<{
+  async validateConnection(testConfig?: { apiKey?: string; apiKeys?: string[]; model?: string }): Promise<{
     success: boolean;
     message: string;
     model: string;
+    keyCount?: number;
   }> {
-    const apiKey = testConfig?.apiKey || process.env.GEMINI_API_KEY;
-    if (!apiKey) {
+    let rawKeys: string[] = [];
+    if (testConfig?.apiKeys && testConfig.apiKeys.length > 0) {
+      rawKeys = testConfig.apiKeys;
+    } else if (testConfig?.apiKey) {
+      rawKeys = testConfig.apiKey.split(/[\r\n,;]+/);
+    } else if (process.env.GEMINI_API_KEYS) {
+      rawKeys = process.env.GEMINI_API_KEYS.split(/[\r\n,;]+/);
+    } else if (process.env.GEMINI_API_KEY) {
+      rawKeys = [process.env.GEMINI_API_KEY];
+    }
+
+    const keys = Array.from(new Set(rawKeys.map((k) => k.trim()).filter((k) => k.length > 0)));
+    if (keys.length === 0) {
       return {
         success: false,
         message: 'No Gemini API key provided or found in configuration/environment.',
-
-        model: testConfig?.model || 'gemini-flash-lite-latest',
+        model: testConfig?.model || GeminiProvider.DEFAULT_MODEL,
       };
     }
 
-    const modelName = testConfig?.model || 'gemini-flash-lite-latest';
+    const modelName = testConfig?.model || GeminiProvider.DEFAULT_MODEL;
+    let validCount = 0;
+    let firstError = '';
 
+    for (let i = 0; i < keys.length; i++) {
+      const key = keys[i];
+      try {
+        const genAI = new GoogleGenerativeAI(key);
+        const model = genAI.getGenerativeModel({ model: modelName });
 
-    try {
-      const genAI = new GoogleGenerativeAI(apiKey);
-      const model = genAI.getGenerativeModel({ model: modelName });
+        const testPromise = model.generateContent({
+          contents: [
+            {
+              role: 'user',
+              parts: [{ text: 'Respond with exactly: {"status":"connected"}' }],
+            },
+          ],
+        });
 
-      // Minimal test prompt with timeout
-      const testPromise = model.generateContent({
-        contents: [
-          {
-            role: 'user',
-            parts: [{ text: 'Respond with exactly: {"status":"connected"}' }],
-          },
-        ],
-      });
+        const timeoutPromise = new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('Connection test timed out after 10 seconds')), 10000),
+        );
 
-      const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('Connection test timed out after 10 seconds')), 10000),
-      );
+        const result = await Promise.race([testPromise, timeoutPromise]);
+        const text = result.response.text();
 
-      const result = await Promise.race([testPromise, timeoutPromise]);
-      const text = result.response.text();
-
-      if (text && text.length > 0) {
-        return {
-          success: true,
-          message: `Successfully connected to Gemini API with model ${modelName}`,
-          model: modelName,
-        };
-      } else {
-        return {
-          success: false,
-          message: 'Received empty response from Gemini API',
-          model: modelName,
-        };
+        if (text && text.length > 0) {
+          validCount++;
+        }
+      } catch (err: any) {
+        if (!firstError) firstError = err.message || 'Unknown error';
+        this.logger.warn(`API Key #${i + 1} (${this.maskKey(key)}) validation error: ${err.message}`);
       }
-    } catch (error: any) {
-      this.logger.error(`Gemini connection test failed: ${error.message}`);
+    }
+
+    if (validCount > 0) {
+      const keyMsg =
+        keys.length > 1
+          ? `${validCount}/${keys.length} API keys verified in rotation pool`
+          : 'API key verified';
       return {
-        success: false,
-        message: `Connection failed: ${error.message || 'Unknown error'}`,
+        success: true,
+        message: `Successfully connected to Gemini API with model ${modelName} (${keyMsg})`,
         model: modelName,
+        keyCount: validCount,
       };
     }
+
+    return {
+      success: false,
+      message: `Connection failed: ${firstError || 'Unable to connect with provided key(s)'}`,
+      model: modelName,
+      keyCount: 0,
+    };
   }
 
   async generateAnswer(
@@ -179,22 +233,33 @@ export class GeminiProvider implements AIProvider {
       isOrderingQuestion?: boolean;
       questionType?: QuestionType;
     },
-    apiKeyOverride?: string,
+    apiKeyOverride?: string | string[],
     modelOverride?: string,
     topicKnowledge?: any[],
     customKnowledgeText?: string,
     webSearchEvidence?: string[],
     images?: QuestionImagePayload[],
   ): Promise<AIAnswerResult> {
-    const apiKey = apiKeyOverride || process.env.GEMINI_API_KEY;
-    if (!apiKey) {
+    let rawKeys: string[] = [];
+    if (Array.isArray(apiKeyOverride)) {
+      rawKeys = apiKeyOverride;
+    } else if (typeof apiKeyOverride === 'string' && apiKeyOverride.trim().length > 0) {
+      rawKeys = apiKeyOverride.split(/[\r\n,;]+/);
+    } else if (process.env.GEMINI_API_KEYS) {
+      rawKeys = process.env.GEMINI_API_KEYS.split(/[\r\n,;]+/);
+    } else if (process.env.GEMINI_API_KEY) {
+      rawKeys = [process.env.GEMINI_API_KEY];
+    }
+
+    const keys = Array.from(new Set(rawKeys.map((k) => k.trim()).filter((k) => k.length > 0)));
+    if (keys.length === 0) {
       throw new Error('Gemini API key is not configured.');
     }
 
     await this.acquireSlot();
     try {
-      return await this.generateAnswerUnqueued(
-        apiKey,
+      return await this.generateAnswerWithKeyRotation(
+        keys,
         question,
         options,
         optionsMetadata,
@@ -207,6 +272,119 @@ export class GeminiProvider implements AIProvider {
     } finally {
       this.releaseSlot();
     }
+  }
+
+  private async generateAnswerWithKeyRotation(
+    keys: string[],
+    question: string,
+    options: { id: string; text: string }[],
+    optionsMetadata?: {
+      isMultipleChoiceMultipleAnswer?: boolean;
+      isOrderingQuestion?: boolean;
+      questionType?: QuestionType;
+    },
+    modelOverride?: string,
+    topicKnowledge?: any[],
+    customKnowledgeText?: string,
+    webSearchEvidence?: string[],
+    images?: QuestionImagePayload[],
+  ): Promise<AIAnswerResult> {
+    const totalKeys = keys.length;
+    let keysAttempted = 0;
+    let lastKeyError: Error | null = null;
+    const startIndex = this.currentKeyIndex % totalKeys;
+
+    while (keysAttempted < totalKeys) {
+      const keyIdx = (startIndex + keysAttempted) % totalKeys;
+      const candidateKey = keys[keyIdx];
+      const now = Date.now();
+      const cooldownUntil = this.keyCooldownUntil.get(candidateKey) || 0;
+
+      if (cooldownUntil > now) {
+        const secsLeft = Math.ceil((cooldownUntil - now) / 1000);
+        this.logger.debug(
+          `Skipping API Key #${keyIdx + 1} (${this.maskKey(candidateKey)}) on cooldown (${secsLeft}s left)`,
+        );
+        keysAttempted++;
+        continue;
+      }
+
+      try {
+        const result = await this.generateAnswerUnqueued(
+          candidateKey,
+          question,
+          options,
+          optionsMetadata,
+          modelOverride,
+          topicKnowledge,
+          customKnowledgeText,
+          webSearchEvidence,
+          images,
+        );
+
+        // Success! Keep active key aligned with this successful key
+        this.currentKeyIndex = keyIdx;
+        return result;
+      } catch (err: any) {
+        lastKeyError = err;
+        const msg: string = err.message || '';
+        const isRateLimited = /429|quota|resource.?exhausted|rate.?limit/i.test(msg);
+        const isKeyInvalid = /api key not valid|invalid api key|forbidden|403|unauthenticated/i.test(msg);
+
+        if (isRateLimited) {
+          const daily = /per.?day|perday|daily/i.test(msg);
+          const waitMs = daily ? msUntilPacificMidnight() : (parseRetryDelayMs(msg) ?? 60000) + 1000;
+          this.keyCooldownUntil.set(candidateKey, Date.now() + waitMs);
+
+          const nextKeyIdx = (keyIdx + 1) % totalKeys;
+          const nextKey = keys[nextKeyIdx];
+
+          if (totalKeys > 1) {
+            this.logger.warn(
+              `🚨 [Key Fallback] API Key #${keyIdx + 1} (${this.maskKey(candidateKey)}) rate-limited (${daily ? 'Daily Quota' : `${Math.round(waitMs / 1000)}s`}). Automatically rotating to Key #${nextKeyIdx + 1} (${this.maskKey(nextKey)})...`,
+            );
+          } else {
+            this.logger.warn(
+              `API Key #${keyIdx + 1} (${this.maskKey(candidateKey)}) rate limited. Skipping it for ${Math.round(waitMs / 1000)}s.`,
+            );
+          }
+
+          keysAttempted++;
+          continue; // Move to next key immediately in rotation pool!
+        }
+
+        if (isKeyInvalid) {
+          this.keyCooldownUntil.set(candidateKey, Date.now() + 86400000);
+          this.logger.error(
+            `❌ [Key Invalid] API Key #${keyIdx + 1} (${this.maskKey(candidateKey)}) is unauthorized/invalid. Rotating to next key...`,
+          );
+          keysAttempted++;
+          continue;
+        }
+
+        // If other error occurred and multiple keys exist, attempt next key
+        if (totalKeys > 1 && keysAttempted < totalKeys - 1) {
+          this.logger.warn(
+            `API Key #${keyIdx + 1} error: ${msg}. Attempting fallback key #${((keyIdx + 1) % totalKeys) + 1}...`,
+          );
+          keysAttempted++;
+          continue;
+        }
+
+        throw err;
+      }
+    }
+
+    // All keys rate limited or failed
+    const now = Date.now();
+    const parked = keys.map((k) => this.keyCooldownUntil.get(k) || 0).filter((t) => t > now);
+    const secs = parked.length > 0 ? Math.max(1, Math.ceil((Math.min(...parked) - now) / 1000)) : 30;
+    if (totalKeys === 1) {
+      throw new Error(`429 All Gemini models are rate limited. Please retry in ${secs}s.`);
+    }
+    throw new Error(
+      `429 All ${totalKeys} configured Gemini API key(s) are rate-limited. Next available key resets in ${secs}s.`,
+    );
   }
 
   private async generateAnswerUnqueued(
@@ -231,11 +409,14 @@ export class GeminiProvider implements AIProvider {
 
     const requestedModel = modelOverride || GeminiProvider.DEFAULT_MODEL;
     const allModels = [requestedModel, ...GeminiProvider.FALLBACK_MODELS.filter((m) => m !== requestedModel)];
+    const getModelCooldown = (m: string) => this.cooldownUntil.get(`${apiKey}:${m}`) || 0;
+    const setModelCooldown = (m: string, until: number) => this.cooldownUntil.set(`${apiKey}:${m}`, until);
+
     // Skip models that are rate limited right now instead of waiting on them
     const now = Date.now();
-    const modelsToTry = allModels.filter((m) => (this.cooldownUntil.get(m) || 0) <= now);
+    const modelsToTry = allModels.filter((m) => getModelCooldown(m) <= now);
     if (modelsToTry.length === 0) {
-      const soonest = Math.min(...allModels.map((m) => this.cooldownUntil.get(m) || now));
+      const soonest = Math.min(...allModels.map((m) => getModelCooldown(m) || now));
       const secs = Math.max(1, Math.ceil((soonest - now) / 1000));
       throw new Error(`429 All Gemini models are rate limited. Please retry in ${secs}s.`);
     }
@@ -558,7 +739,7 @@ STRICT INSTRUCTIONS:
           if (isRateLimited) {
             const daily = /per.?day|perday|daily/i.test(msg);
             const waitMs = daily ? msUntilPacificMidnight() : (parseRetryDelayMs(msg) ?? 60000) + 1000;
-            this.cooldownUntil.set(currentModelName, Date.now() + waitMs);
+            setModelCooldown(currentModelName, Date.now() + waitMs);
             this.logger.warn(
               `${currentModelName} rate limited (${daily ? 'daily quota' : 'per-minute'}). Skipping it for ${Math.round(waitMs / 1000)}s.`,
             );
@@ -567,14 +748,14 @@ STRICT INSTRUCTIONS:
           // Overloaded (503 "high demand") or too slow: park it for 2 minutes, use the next model
           const isOverloaded = /503|overloaded|high demand|service unavailable|timed out/i.test(msg);
           if (isOverloaded) {
-            this.cooldownUntil.set(currentModelName, Date.now() + 120000);
+            setModelCooldown(currentModelName, Date.now() + 120000);
             this.logger.warn(`${currentModelName} overloaded/slow. Skipping it for 120s.`);
             break;
           }
 
           if (isUnavailable) {
             // Retired or not enabled for this key: never try it again this run
-            this.cooldownUntil.set(currentModelName, Date.now() + 24 * 3600 * 1000);
+            setModelCooldown(currentModelName, Date.now() + 24 * 3600 * 1000);
           }
 
           if (isUnavailable) {
@@ -594,7 +775,7 @@ STRICT INSTRUCTIONS:
 
     // Everything we tried was rate limited: say when the first model frees up again
     const after = Date.now();
-    const parked = allModels.map((m) => this.cooldownUntil.get(m) || 0).filter((t) => t > after);
+    const parked = allModels.map((m) => getModelCooldown(m)).filter((t) => t > after);
     if (parked.length === allModels.length) {
       const secs = Math.max(1, Math.ceil((Math.min(...parked) - after) / 1000));
       throw new Error(`429 All Gemini models are rate limited. Please retry in ${secs}s.`);
