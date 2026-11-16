@@ -40,7 +40,7 @@ export class ConfigService {
     const isConfigured = hasDbKey || hasEnvFallback;
     const selectedModel =
 
-      dbModelRow?.value || process.env.GEMINI_DEFAULT_MODEL || 'gemini-flash-lite-latest';
+      dbModelRow?.value || process.env.GEMINI_DEFAULT_MODEL || GeminiProvider.DEFAULT_MODEL;
 
 
     return {

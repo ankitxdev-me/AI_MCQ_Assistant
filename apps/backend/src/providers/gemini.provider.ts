@@ -46,7 +46,8 @@ export class GeminiProvider implements AIProvider {
 
   // Kept to models Google lists as available. 1.5 / 2.0 are shut down, 2.5 is limited to
   // existing users. Update this list when Google retires a model.
-  static readonly DEFAULT_MODEL = 'gemini-3.5-flash-lite';
+  // Alias Google keeps pointed at its newest Flash-Lite (chosen in c1979fe for its rate limits)
+  static readonly DEFAULT_MODEL = 'gemini-flash-lite-latest';
 
   /**
    * Gemini calls are queued. Several tabs running Auto-Loop at once used to fire requests in
@@ -76,6 +77,7 @@ export class GeminiProvider implements AIProvider {
   }
   private readonly availableModels = [
     'gemini-flash-lite-latest',
+    'gemini-3.5-flash-lite',
     'gemini-3.1-flash-lite',
     'gemini-3.6-flash',
     'gemini-3.8-flash',
@@ -88,10 +90,12 @@ export class GeminiProvider implements AIProvider {
    * separate quota and is the last resort.
    */
   static readonly FALLBACK_MODELS = [
+    'gemini-flash-lite-latest',
     'gemini-3.5-flash-lite',
-    'gemini-2.5-flash',
-    'gemini-flash-latest',
-
+    'gemini-3.1-flash-lite',
+    'gemini-3.6-flash',
+    'gemini-3.8-flash',
+    'gemma-4-26b-a4b-it',
   ];
 
   /** Model -> time (ms) until which it is rate limited. Skipped until then, no waiting. */

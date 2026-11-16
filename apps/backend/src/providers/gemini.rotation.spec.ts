@@ -41,12 +41,13 @@ describe('Gemini model rotation under rate limits', () => {
     const p = new GeminiProvider();
     limited.add('gemini-3.1-flash-lite');
 
+    const firstFallback = GeminiProvider.FALLBACK_MODELS[0];
     await ask(p, 'gemini-3.1-flash-lite');
-    expect(calls).toEqual(['gemini-3.1-flash-lite', 'gemini-3.5-flash-lite']);
+    expect(calls).toEqual(['gemini-3.1-flash-lite', firstFallback]);
 
     calls.length = 0;
     await ask(p, 'gemini-3.1-flash-lite');
-    expect(calls).toEqual(['gemini-3.5-flash-lite']); // no wasted call on the parked model
+    expect(calls).toEqual([firstFallback]); // no wasted call on the parked model
     expect(p.getCooldowns().map((c) => c.model)).toContain('gemini-3.1-flash-lite');
   });
 
@@ -86,7 +87,7 @@ describe('Gemini model rotation under rate limits', () => {
     broken.add('gemini-3.5-flash-lite');
     const r = await ask(p, 'gemini-3.5-flash-lite');
     expect(r.selected_option_id).toBe('A');
-    expect(calls).toEqual(['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite']);
+    expect(calls).toEqual(['gemini-3.5-flash-lite', GeminiProvider.FALLBACK_MODELS[0]]);
     expect(p.getCooldowns().map((c) => c.model)).toContain('gemini-3.5-flash-lite');
   });
 });

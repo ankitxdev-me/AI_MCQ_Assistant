@@ -15,7 +15,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
   onCancel,
 }) => {
   const [apiKey, setApiKey] = useState('');
-  const [model, setModel] = useState(configStatus?.model || 'gemini-3.5-flash-lite');
+  const [model, setModel] = useState(configStatus?.model || 'gemini-flash-lite-latest');
   const [showKey, setShowKey] = useState(false);
   const [isTesting, setIsTesting] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
@@ -161,7 +161,7 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
               onChange={(e) => setModel(e.target.value)}
               className="w-full text-xs rounded-lg border border-slate-300 bg-white px-3 py-2 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
             >
-              {(configStatus?.availableModels || ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.6-flash']).map(
+              {(configStatus?.availableModels || ['gemini-flash-lite-latest', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.6-flash']).map(
                 (m, i) => (
                   <option key={m} value={m}>
                     {m} {i === 0 ? '(Recommended - Fast & Cheap)' : ''}
